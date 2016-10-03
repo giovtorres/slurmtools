@@ -1,0 +1,409 @@
+#!/usr/bin/python
+
+"""
+what-cpus - A script that will report all process IDs (PIDs) for all Slurm
+            jobs running on a node.  For each PID, get all the thread IDs
+            (TIDs) running under that process and report the state and
+            processor last run for each.
+
+            This is designed to run directly on a node that is running Slurm
+            jobs.
+"""
+
+import os
+import re
+import subprocess
+import sys
+from collections import defaultdict
+
+import argparse
+import psutil
+
+
+def get_last_processor(pid):
+    """Return a list of dictionaries for a given PID.  Each dictionary
+       will include a mapping of each Thread ID for a given PID and that
+       Thread's state and last run processor."""
+
+    # Search the pids task directory for a list of thread ids
+    try:
+        thread_ids = os.listdir("/proc/%s/task" % pid)
+    except OSError:
+        return
+
+    # Sort the list
+    thread_ids.sort()
+
+    # Initialize variable
+    list_of_running_threads = defaultdict(list)
+
+    # For each thread id in the list of all thread ids, append the thread id
+    # to the 'retlist' list only if the thread is in the RUNNING state
+    for thread_id in thread_ids:
+        # filename is the stat directory of a given thread id
+        pidstat = "/proc/%s/task/%s/stat" % (pid, thread_id)
+        try:
+            # Read and store the output of /proc/PID/task/TID/stat
+            with open(pidstat, 'rb') as fname:
+                stat = fname.read().strip()
+        except:
+            # no such file or directory; it means the
+            # thread disappeared on us
+            continue
+        else:
+            # Split the stat output by space; the index of each value can be found
+            # here: http://man7.org/linux/man-pages/man5/proc.5.html
+            if stat:
+                global cpu_count
+                values = stat.split()
+                state = values[2]
+                processor = values[38]
+                rss = values[23]
+                cpu_affinity = get_cpu_affinity(int(thread_id))
+                if cpu_affinity is not None:
+                    if len(cpu_affinity) == cpu_count:
+                        cpu_affinity = ["0-" + str(len(cpu_affinity) - 1)]
+                list_of_running_threads.update({thread_id: [state, processor, rss, cpu_affinity]})
+
+    return list_of_running_threads
+
+
+def human_readable(num, suffix="B"):
+    """Convert bytes to a human readable form"""
+    if num == 0:
+        return "0.0 GB"
+    else:
+        for unit in ['', 'K', 'M', 'G', 'T', 'P']:
+            if abs(num) < 1024.0:
+                return "%.1f %s%s" % (num, unit, suffix)
+            num /= 1024.0
+
+
+def colorize(text, color):
+    """Return a colorized input."""
+
+    RED = "\033[0;31m"
+    GREEN = "\033[0;32m"
+    NC = "\033[0;0m"
+
+    if color == "red":
+        return RED + text + NC
+    elif color == "green":
+        return GREEN + text + NC
+    else:
+        return text
+
+
+def print_cpu_affinity(cpu_affinity, cpu_color_map):
+    """Return two lists, the top row should be core IDs and the bottom row
+    should be the corresponding hyperthread."""
+
+    cpu_affinity = sorted(cpu_affinity)
+    numcores = len(cpu_affinity) / 2
+
+    if numcores == 1:
+        print "CPU Affinity ({0} core)".format(numcores)
+    else:
+        print "CPU Affinity ({0} cores)".format(numcores)
+
+    cores = cpu_affinity[:numcores]
+    print "   \_ cores       |",
+
+    for core in cores:
+        if str(core) in cpu_color_map:
+            if cpu_color_map[str(core)] == 1:
+                if len(str(core)) == 1:
+                    print " {0}|".format(colorize(str(core), "green").rstrip()),
+                else:
+                    print "{0}|".format(colorize(str(core), "green").rstrip()),
+            elif cpu_color_map[str(core)] > 1:
+                if len(str(core)) == 1:
+                    print " {0}|".format(colorize(str(core), "red").rstrip()),
+                else:
+                    print "{0}|".format(colorize(str(core), "red").rstrip()),
+        else:
+            print "{0:>2}|".format(core),
+
+
+    print ""
+
+    hyperthreads = cpu_affinity[numcores:]
+    print "   \_ hypercores  |",
+
+    for ht in hyperthreads:
+        if str(ht) in cpu_color_map:
+            if cpu_color_map[str(ht)] == 1:
+                if len(str(ht)) == 1:
+                    print " {0}|".format(colorize(str(ht), "green").rstrip()),
+                else:
+                    print "{0}|".format(colorize(str(ht), "green").rstrip()),
+            elif cpu_color_map[str(ht)] > 1:
+                if len(str(ht)) == 1:
+                    print " {0}|".format(colorize(str(ht), "red").rstrip()),
+                else:
+                    print "{0}|".format(colorize(str(ht), "red").rstrip()),
+        else:
+            print "{0:>2}|".format(ht),
+    print "\n"
+
+    return None
+
+
+def get_all_slurmstepd_pids():
+    """Return list of pids for all slurmstepd processes."""
+    try:
+        return [p.pid for p in psutil.process_iter()
+                if "slurmstepd" in str(p.name)]
+    except:
+        return
+
+
+def get_cpu_affinity(pid):
+    """Return a list of allowed CPUs for a given PID"""
+    try:
+        return psutil.Process(pid).cpu_affinity()
+    except psutil.NoSuchProcess:
+        return
+
+
+def get_all_running_processes():
+    """Returns a list of process ids for all jobs in the running state,
+       excluding the pid of noded itself"""
+    thispid = os.getpid()
+    rpids = set()
+    for pid in psutil.pids():
+        try:
+            if psutil.Process(pid).status() == 'running' or psutil.Process(pid).status() == 'disk-sleep':
+                rpids.add(pid)
+        except psutil.NoSuchProcess:
+                continue
+    return rpids
+
+
+def process_orphans(rpids):
+    """Return a dictionary of user pid information for running pids not under
+    slurm/cgroups control."""
+    orphan_pids = defaultdict(lambda: defaultdict(int))
+
+    for pid in rpids:
+        try:
+            pidinfo = psutil.Process(pid)
+            user = pidinfo.username()
+
+            # FIXME: num_threads should be number of RUNNING threads
+            orphan_pids[user]['process_name'] = pidinfo.name()
+            orphan_pids[user]['num_threads'] += pidinfo.num_threads()
+            orphan_pids[user]['memory'] += pidinfo.memory_info().rss
+        except psutil.NoSuchProcess:
+            continue
+
+    return orphan_pids
+
+
+def main(args):
+
+    PAGESIZE = 4096
+
+    # Match slurmstepd processes, with or without jobsteps
+    slurmstepd_pids = get_all_slurmstepd_pids()
+
+    # If there are jobs actually running, do stuff...
+    if slurmstepd_pids:
+
+        # Initialize list of users running jobs on this node
+        global running_pids
+
+        total_jobs_on_node = len(slurmstepd_pids)
+        userlist = set()
+
+        # For each slurmstepd PID, get the jobid and the CPU Affinity, which is
+        # the list of CPUs allocated by SLURM with which this job can run on.
+        # Then, use the pid to thread mapping list to build an output of:
+        # JobID:
+        # User:
+        # CPU Affinity
+        #   PID
+        #     \_ TID - State - Processor - RSS
+        #     \_ TID - State - Processor - RSS
+        for index, stepdpid in enumerate(slurmstepd_pids):
+            regex = re.compile("\d+")
+            try:
+                # Parse jobid from 'ps' output for the slurmstepd pid
+                jobid = regex.search(psutil.Process(stepdpid).cmdline()[0]).group()
+            except (psutil.NoSuchProcess, AttributeError):
+                continue
+
+            # Get the CPU affinity of the slurmstepd process; all children of
+            # this process, i.e. the job, will inherit this affinity
+            stepd_cpus = get_cpu_affinity(stepdpid)
+
+            print "JobID : %s (#%s)" % (jobid, index + 1)
+
+            # Get all children process of slurmstepd (as objects)
+            children_procs = psutil.Process(stepdpid).children(recursive=True)
+
+            # Get all pids of the children process (as integers)
+            children_pids = [pid.pid for pid in children_procs]
+
+            running_pids -= set(children_pids)
+
+            # Use the first children pid to determine the owner of the job
+            user = psutil.Process(children_pids[0]).username()
+            userlist.add(user)
+
+            print "User  :", user
+
+            # Initialize other variables
+            all_user_processes = []
+            cpu_color_map = defaultdict(int)
+            total_threads = 0
+            total_running_threads = 0
+            total_rss = 0
+
+            # For each of the slurmstepd children pids, get all threads and
+            # their TID, state, processor and memory
+            pid_and_threads = dict((pid, get_last_processor(pid))
+                                     for pid in children_pids
+                                     if get_last_processor(pid))
+
+            # Find out which cpus have running threads; this will be used to
+            # colorize the output of running and overloaded cores
+            for mapping in pid_and_threads.itervalues():
+                if mapping is not None:
+                    total_rss += int(mapping.values()[0][2]) * PAGESIZE
+                for tids in mapping.itervalues():
+                    total_threads += 1
+                    if tids[0] == "R":
+                        total_running_threads += 1
+                        cpu_color_map[tids[1]] += 1
+
+            # Print CPU affinity
+            print_cpu_affinity(stepd_cpus, cpu_color_map)
+
+            if not args.cpuonly:
+                # Print each mapping of {PID: {TID: state, processor, memory}}
+                global cpu_count
+
+                for pid, tids in sorted(pid_and_threads.iteritems()):
+                    cpu_list = get_cpu_affinity(int(pid))
+
+                    #if len(get_cpu_affinity(int(pid))) == cpu_count:
+                    if cpu_list is not None:
+                        if len(cpu_list) == cpu_count:
+                            cpu_list = ["0-" + str(len(cpu_list) - 1)]
+
+                    try:
+                        process_name = psutil.Process(pid).name()
+                    except psutil.NoSuchProcess:
+                        continue
+                    else:
+                        print "{0:>7} {1:>6} {2:<51} {3}".format("PID:",
+                                                                   pid,
+                                                                   "(" + process_name + ")",
+                                                                   repr(cpu_list).replace(' ', ''))
+
+                    for tid, tidinfo in sorted(tids.iteritems()):
+                        # This whole section needs to get fixed; can't seem to
+                        # line up the cpu/hypercore map due to the color
+                        # formatting; hence, this very bad hack to line it up
+
+                        color = "none"
+
+                        # Set color for running threads
+                        if tidinfo[0] == "R":
+                            if tidinfo[1] in cpu_color_map:
+                                if cpu_color_map[tidinfo[1]] == 1:
+                                    color = "green"
+                                elif cpu_color_map[tidinfo[1]] > 1:
+                                    color = "red"
+
+                        # If there are no running threads, hence no color
+                        if color == "none":
+                            print "     \_ TID:{0:>6}   " \
+                                  "State:{1:>2}   " \
+                                  "Processor:{2:>3}   " \
+                                  "RSS:{3:>9}      " \
+                                  "{4}".format(tid,
+                                               colorize(tidinfo[0], color),
+                                               colorize(tidinfo[1], color),
+                                               human_readable(int(tidinfo[2]) * PAGESIZE),
+                                               repr(tidinfo[3]).replace(' ', ''))
+                        else:
+                            # If processor ID is single digits (for formatting)
+                            if len(tidinfo[1]) == 1:
+                                print "     \_ TID:{0:>6}   " \
+                                      "State: {1}   " \
+                                      "Processor:  {2}   " \
+                                      "RSS:{3:>9}      " \
+                                      "{4}".format(tid,
+                                                   colorize(tidinfo[0], color).rstrip(),
+                                                   colorize(tidinfo[1], color).rstrip(),
+                                                   human_readable(int(tidinfo[2]) * PAGESIZE),
+                                                   repr(tidinfo[3]).replace(' ', ''))
+                            # If processor ID is double digits (for formatting)
+                            else:
+                                print "     \_ TID:{0:>6}   " \
+                                      "State: {1}   " \
+                                      "Processor: {2}   " \
+                                      "RSS:{3:>9}      " \
+                                      "{4}".format(tid,
+                                                   colorize(tidinfo[0], color).rstrip(),
+                                                   colorize(tidinfo[1], color).rstrip(),
+                                                   human_readable(int(tidinfo[2]) * PAGESIZE),
+                                                   repr(tidinfo[3]).replace(' ', ''))
+
+            print "Job Summary: {0} running thread(s) / {1} total threads".format(total_running_threads,
+                                                                                  total_threads)
+            print "             {0} core(s), using {1} of RAM".format(len(stepd_cpus) / 2,
+                                                                      human_readable(total_rss))
+            print ""
+
+        print "\nNode Summary:"
+        print "  Number of Jobs : %s" % total_jobs_on_node
+        print "  Number of Users: %s" % len(userlist)
+        print "  User List      :",
+
+        for user in userlist:
+            print user,
+
+        print ""
+    else:
+        # ... or else just exit if there are no running jobs on the machine
+        print "No jobs running."
+
+
+if __name__ == "__main__":
+    # Command line arguments go here
+    parser = argparse.ArgumentParser(description="what's running on which CPUs")
+    parser.add_argument("-c", help="show only CPU affinity", action="store_true", dest="cpuonly")
+    args = parser.parse_args()
+
+    # CPU Count
+    cpu_count = psutil.cpu_count(logical=True)
+
+    # Get all running processes
+    running_pids = get_all_running_processes()
+
+    # Run the main function to get info of any running slurm jobs, if any, and
+    # print it to the stdout
+    main(args)
+
+    # Print system resources info (sometimes there are:
+    # 1. running procs that stick around after detaching from parent pid
+    # 2. lscratch teardowns that cause high load even though no jobs are
+    #    running on the node.
+    print "\nSystem Info:"
+    print "  CPU   : %.2f%%" % psutil.cpu_percent(interval=0.5, percpu=False)
+    print "  Load  : %.2f %.2f %.2f" % (os.getloadavg())
+    print "  Memory: %.2f%%" % psutil.virtual_memory().percent
+    print "  Swap  : %.2f%%" % psutil.swap_memory().percent
+
+    if running_pids:
+        print "\nFound Other Running Processes:"
+        orphans = process_orphans(running_pids)
+        for user, values in orphans.iteritems():
+            print "\n  User: %s" % user
+            print "    Process Name: %s" % values["process_name"]
+            print "    Num Threads : %s" % values["num_threads"]
+            print "    Used Memory : %s" % human_readable(values["memory"])
+
