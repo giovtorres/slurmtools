@@ -3,6 +3,11 @@
 The **what-cpus** script prints process and thread information for all Slurm
 jobs running on a compute node.  
 
+## Dependencies
+
+[psutil](https://github.com/giampaolo/psutil) is required.
+
+
 ## Example
 
 ```
