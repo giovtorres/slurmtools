@@ -1,0 +1,373 @@
+#!/usr/bin/python
+
+"""
+salljobs - Return resource usage for all users.
+"""
+
+import sys
+from collections import defaultdict
+from pwd import getpwnam, getpwuid
+
+import argparse
+import pyslurm
+
+# Print formatting for -u (by user)
+HEADER_FORMAT = "{0:>39}{1:>22}"
+LINE_FORMAT = "{0:>20}{1:>7}{2:>6}{3:>6}{4:>10}{5:>6}{6:>6}"
+
+# Print formatting for -p (by partition)
+LINE_FORMAT_P1 = "{0:<20}{1:>13}{2:>6}{3:>6}{4:>6}{5:>6}"
+LINE_FORMAT_P2 = "{0:>33}{1:>6}{2:>6}{3:>6}{4:>6}"
+
+# SLURM job states
+STATES = {"PENDING": "PD",          # queued, waiting for initiation
+          "RUNNING": "R",           # allocated resources and executing
+          "CANCELLED": "CA",        # cancelled by user
+          "CONFIGURING": "CF",      # allocated nodes booting
+          "COMPLETING": "CG",       # waiting for epilog completion
+          "COMPLETED": "CD",        # completed execution successfully
+          "FAILED": "F",            # completed execution unsuccessfully
+          "TIMEOUT": "TO",          # terminated on reaching time limit
+          "NODE_FAIL": "NF",        # terminated on node failure
+          "PREEMPTED": "PR",        # terminated due to preemption
+          "SUSPENDED": "S",         # allocated resources, execution suspended
+          "SPECIAL_EXIT": "SE"}     # requeue an exit job in hold
+
+def sum_pending(array_tasks):
+    """Return sum of nodelist for pending jobs.  E.g. [0-10] = 11 nodes"""
+    if not "-" in array_tasks:
+        return 1
+    else:
+        if "%" in array_tasks:
+            pos = array_tasks.index("%")
+            array_tasks = array_tasks[:pos]
+        start, end = array_tasks.split("-")
+        return int(end) - int(start) + 1
+
+
+def rehash_job_dict(jobs):
+    new_dict = defaultdict(list)
+    for key, value in jobs.items():
+        user_id = value.get("user_id")
+        user_name = getpwuid(user_id)[0]
+        new_dict[user_name].append(value)
+    return new_dict
+
+def display_by_user(userlist, all_nodes, all_jobs):
+    """Display a list of all jobs, by default, formatted by user with the -u
+       option.  The -u option can take a space separated list of one or more
+       users."""
+
+    print ""
+    print HEADER_FORMAT.format("RUNNING/USED", "PENDING/REQUESTED")
+    print HEADER_FORMAT.format("-" * 17, "-" * 17)
+    print LINE_FORMAT.format("USERNAME", "CPUS", "NODES", "JOBS",
+                             "CPUS", "NODES", "JOBS")
+
+    total_procs_request = 0
+    total_nodes_request = 0
+    total_procs_used = 0
+    total_nodes_used = 0
+    total_job_running = 0
+    total_job_pending = 0
+
+    rehashed_jobs = rehash_job_dict(all_jobs)
+
+    for user in sorted(userlist):
+
+        try:
+            user_jobs = rehashed_jobs.get(user)
+        except KeyError:
+            sys.exit("Username not found.")
+
+        procs_request = 0
+        nodes_request = 0
+        procs_used = 0
+        nodes_used = set()
+        running = 0
+        pending = 0
+
+        if user_jobs is None:
+            continue
+
+        for job in user_jobs:
+            if job["job_state"] == "RUNNING":
+                running += 1
+                procs_used += job["num_cpus"]
+                nodes_alloc = job["cpus_allocated"].keys()
+                nodes_used.update(nodes_alloc)
+            elif job["job_state"] == "PENDING":
+                # If a job is pending, get the total number of pending subjobs,
+                # instead of counting it as just a single pending job.  For
+                # example, a pending swarm could have a 100 pending subjobs
+                if job.get("array_task_str") is not None:
+                    pending += sum_pending(job["array_task_str"])
+                else:
+                    pending += 1
+                procs_request += job["num_cpus"]
+                nodes_request += job["num_nodes"]
+
+        total_procs_request += procs_request
+        total_nodes_request += nodes_request
+        total_procs_used += procs_used
+        total_job_running += running
+        total_job_pending += pending
+
+        print LINE_FORMAT.format(user,
+                                 procs_used,
+                                 len(nodes_used),
+                                 running,
+                                 procs_request,
+                                 nodes_request,
+                                 pending)
+
+    # If one or more users are not specified, print a TOTAL summary
+    if not args.user:
+        used_nodes = get_used_nodes(all_nodes)
+        total_cpus = get_total_cpus(all_nodes)
+
+        print HEADER_FORMAT.format("-" * 17, "-" * 17)
+        print LINE_FORMAT.format("TOTAL",
+                                 str(total_procs_used),
+                                 str(used_nodes),
+                                 total_job_running,
+                                 total_procs_request,
+                                 total_nodes_request,
+                                 total_job_pending)
+
+        print LINE_FORMAT.format("AVAILABLE",
+                                 str(total_cpus),
+                                 str(len(nodes)), "", "", "", "")
+        print ""
+
+
+def display_by_partition(jobs, partlist, userlist):
+    """Display a list of all jobs formatted by partition with the -p
+       option.  The -p option can take a space separated list of one or more
+       users."""
+
+    if userlist is None:
+        # If users are not specified at the command line with the -p option,
+        # get all users
+        userset = set(value["user_id"]
+                      for value in jobs.itervalues())
+        users = [getpwuid(user)[0] for user in userset]
+    else:
+        users = userlist
+
+    print LINE_FORMAT_P1.format("USERNAME", "PARTITION", "STATE", "CPUS", "NODES", "JOBS")
+    print ""
+
+    # Define default nested dictionaries for totals that take either an int or
+    # a set as a default value
+    cluster_totals_bypart = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+    cluster_totals_bystate = defaultdict(lambda: defaultdict(int))
+    total_nodes_used = defaultdict(lambda: defaultdict(lambda: defaultdict(set)))
+
+    rehashed_jobs = rehash_job_dict(jobs)
+
+    for user in sorted(users):
+
+        # Define default nested dictionaries for per-user totals that take
+        # either an int or a set as a default value
+        user_totals = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+        nodes_used = defaultdict(lambda: defaultdict(lambda: defaultdict(set)))
+        user_jobs = rehashed_jobs.get(user)
+
+        if user_jobs is None:
+            print "User has no running jobs."
+            sys.exit(1)
+
+        for job in user_jobs:
+            partition = job["partition"]
+            if partlist is None or partition in partlist:
+                job_state = job["job_state"]
+                cpus = job["num_cpus"]
+                nodes_alloc = job["cpus_allocated"].keys()
+                nodes_used[partition][job_state]["node_set"].update(nodes_alloc)
+                total_nodes_used[partition][job_state]["node_set"].update(nodes_alloc)
+
+                if job_state == "PENDING":
+                    # If a job is pending, get the total number of pending subjobs,
+                    # instead of counting it as just a single pending job.  For
+                    # example, a pending swarm could have a 100 pending subjobs
+                    if job.get("array_task_str") is not None:
+                        user_totals[partition][job_state]["jobs"] += sum_pending(job["array_task_str"])
+                    else:
+                        user_totals[partition][job_state]["jobs"] += 1
+                else:
+                    user_totals[partition][job_state]["jobs"] += 1
+
+                user_totals[partition][job_state]["cpus"] += cpus
+
+        line_counter = 0
+
+        for part, states in sorted(user_totals.iteritems()):
+            for state, totals in reversed(sorted(states.iteritems())):
+                cluster_totals_bypart[part][state]["jobs"] += totals["jobs"]
+                cluster_totals_bypart[part][state]["cpus"] += totals["cpus"]
+
+                if line_counter == 0:
+                    print LINE_FORMAT_P1.format(user,
+                                                part,
+                                                STATES[state],
+                                                totals["cpus"],
+                                                len(nodes_used[part][state]["node_set"]),
+                                                totals["jobs"])
+                else:
+                    print LINE_FORMAT_P2.format(part,
+                                                STATES[state],
+                                                totals["cpus"],
+                                                len(nodes_used[part][state]["node_set"]),
+                                                totals["jobs"])
+                line_counter += 1
+
+    print ""
+    print "SUMMARY BY PARTITION"
+
+    print LINE_FORMAT_P2.format("PARTITION", "STATE", "CPUS", "NODES", "JOBS")
+
+    for c_part, c_states in sorted(cluster_totals_bypart.iteritems()):
+        c_line_counter = 0
+        for c_state, c_totals in reversed(sorted(c_states.iteritems())):
+            cluster_totals_bystate[c_state]["jobs"] += c_totals["jobs"]
+            cluster_totals_bystate[c_state]["cpus"] += c_totals["cpus"]
+            sum_nodes = len(total_nodes_used[c_part][c_state]["node_set"])
+            cluster_totals_bystate[c_state]["sum_nodes"] += sum_nodes
+
+            if c_line_counter == 0:
+                print LINE_FORMAT_P2.format(c_part,
+                                          STATES[c_state],
+                                          c_totals["cpus"],
+                                          sum_nodes,
+                                          c_totals["jobs"])
+            else:
+                print LINE_FORMAT_P2.format("",
+                                          STATES[c_state],
+                                          c_totals["cpus"],
+                                          sum_nodes,
+                                          c_totals["jobs"])
+            c_line_counter += 1
+
+    print ""
+    print "SUMMARY BY STATE"
+
+    print LINE_FORMAT_P2.format("", "STATE", "CPUS", "NODES", "JOBS")
+
+    for cs_state, cs_values in reversed(sorted(cluster_totals_bystate.iteritems())):
+        print LINE_FORMAT_P2.format("",
+                                  STATES[cs_state],
+                                  cs_values["cpus"],
+                                  cs_values["sum_nodes"],
+                                  cs_values["jobs"])
+
+
+def get_used_nodes(nodelist):
+    """Return number of used nodes, i.e. those in the MIXED or ALLOCATED
+       states."""
+    return len([node for node, values in nodelist.iteritems()
+                if values['state'] == "ALLOCATED"
+                or values['state'] == "MIXED"])
+
+
+def get_total_cpus(nodelist):
+    """Return total number of available CPUs.  Those nodes in the Down and
+       Drain* states are not counted in the totals."""
+    return sum([values['cpus'] for values in nodelist.itervalues()
+                if not any(_ in values["state"]
+                           for _ in ["DOWN", "DRAIN"])])
+
+
+def check_users(users):
+    """Slurm reports numeric user ids.  This function checks to see if the user
+        is in /etc/passwd, i.e. a valid user.  If not, exit with unknown user
+        message."""
+    for user in users:
+        try:
+            usertest = getpwnam(user)
+        except KeyError:
+            print "Username (%s) not found." % user
+            sys.exit(1)
+
+def get_jobs(user=None):
+    if user is None:
+        try:
+            jobs = pyslurm.job().get()
+        except ValueError as e:
+            print 'Query failed - %s' % (e)
+            sys.exit(1)
+        else:
+            return jobs
+    else:
+        jobs = {}
+        try:
+            for u in user:
+                jobs.update(pyslurm.job().find_user(u))
+        except ValueError as e:
+            print 'Query failed - %s' % (e)
+            sys.exit(1)
+        else:
+            return jobs
+
+
+def get_nodes():
+    try:
+        nodes = pyslurm.node().get()
+    except ValueError as e:
+        print 'Query failed - %s' % (e)
+        sys.exit(1)
+    else:
+        return nodes
+
+
+if __name__ == "__main__":
+    # Set up command line arguments
+    description = "Query user jobs"
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument("-u", help="query by user(s) (space separated)",
+                        nargs="+", dest="user")
+    parser.add_argument("-p", help="query by partition(s) (space separated)",
+                        nargs="*", dest="part")
+    args = parser.parse_args()
+
+    # -p
+    if args.part == [] and args.user is None:
+        jobs = get_jobs()
+        display_by_partition(jobs, partlist=None, userlist=None)
+    # -p part
+    elif args.part is not None and args.user is None:
+        jobs = get_jobs()
+        partlist = args.part
+        display_by_partition(jobs, partlist=partlist, userlist=None)
+    # -p -u user
+    elif args.part == [] and args.user is not None:
+        check_users(args.user)
+        userlist = args.user
+        jobs = get_jobs(userlist)
+        display_by_partition(jobs, partlist=None, userlist=userlist)
+    # -p part -u user
+    elif args.part is not None and args.user is not None:
+        check_users(args.user)
+        partlist = args.part
+        userlist = args.user
+        jobs = get_jobs(userlist)
+        display_by_partition(jobs, partlist=partlist, userlist=userlist)
+    # -u user
+    elif args.user:
+        users = args.user
+        check_users(users)
+        jobs = get_jobs(users)
+        nodes = get_nodes()
+        display_by_user(users, nodes, jobs)
+    # if no command-line arguments given, only show users that have at least
+    # running and or pending jobs.  These users may also have jobs in other
+    # transitional states.
+    else:
+        jobs = get_jobs()
+        nodes = get_nodes()
+        userset = set(value["user_id"]
+                      for value in jobs.itervalues()
+                      if value["job_state"] == "RUNNING"
+                      or value["job_state"] == "PENDING")
+        users = [getpwuid(user)[0] for user in userset]
+        display_by_user(users, nodes, jobs)
