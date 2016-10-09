@@ -56,5 +56,5 @@ For CPUs and or Memory, the various states are defined as follows:
 
 ## License
 
-This project is in the worldwide public domain.  See [LICENSE](LICENSE.md) for
+This project is in the worldwide public domain.  See [LICENSE](../LICENSE.md) for
 more information.

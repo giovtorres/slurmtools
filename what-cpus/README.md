@@ -71,5 +71,5 @@ example, CPU0 is the core CPU and CPU16 is its hyperthread, and so on.
 
 ## License
 
-This project is in the worldwide public domain.  See [LICENSE](LICENSE.md) for
+This project is in the worldwide public domain.  See [LICENSE](../LICENSE.md) for
 more information.
