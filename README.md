@@ -16,7 +16,7 @@ Report the cluster utilization (Nodes, CPUs and Memory).
 
 A diagnostic tool that reports all processes and threads for all jobs on a
 given compute node.  Information about each job also reports the CPU affinity,
-memory usage, and current state (R, D, S)
+memory usage, and current state (R, D, S).
 
 ## License
 
