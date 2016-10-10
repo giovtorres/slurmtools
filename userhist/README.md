@@ -37,10 +37,12 @@ optional arguments:
 ## Example
 
 ```
+[giovanni@node ~]$ ./userhist -t 48h user1
+
 -------------- Jobs ended in the last 48h for user1 --------------
          JOBID             USER   PARTITION CPUS            STARTTIME              ENDTIME      STATE NODELIST
-       4815610            user1        norm   32  2016-10-08 05:31:27  2016-10-08 20:21:45  COMPLETED cn0799
-       4815565            user1        norm   32  2016-10-08 04:49:03  2016-10-09 04:49:15    TIMEOUT cn0882
+       4815610            user1        norm   32  2016-10-08 05:31:27  2016-10-08 20:21:45  COMPLETED c09
+       4815565            user1        norm   32  2016-10-08 04:49:03  2016-10-09 04:49:15    TIMEOUT c08
 ```
 
 ## License
