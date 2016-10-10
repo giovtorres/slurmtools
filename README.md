@@ -12,6 +12,11 @@ partition.
 
 Report the cluster utilization (Nodes, CPUs and Memory).
 
+## [userhist](userhist)
+
+Report completed jobs for a given user. Slurm must be configured to use the
+Elasticsearch job completion plugin.
+
 ## [what-cpus](what-cpus)
 
 A diagnostic tool that reports all processes and threads for all jobs on a

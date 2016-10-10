@@ -1,0 +1,98 @@
+#!/usr/bin/python
+
+"""
+userhist - Report completed jobs for a given user
+"""
+
+from __future__ import print_function
+
+import xml.utils.iso8601
+from datetime import datetime as dt
+
+import argparse
+import elasticsearch
+from elasticsearch import helpers
+
+past_hdr_fmt = "{0:>14} {1:>16} {2:>11} {3:>4} {4:>20} {5:>20} {6:>10} {7:>}"
+
+def get_past_jobs(user, last):
+    """Get past jobs from Elasticsearch for a given user """
+    query = {
+        "query": {
+            "filtered": {
+                "filter": {
+                    "bool": {
+                        "must": [
+                            {
+                                "range": {
+                                    "@end": {
+                                        "gt": "now-" + last
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                },
+                "query": {
+                    "match": {
+                        "username": user,
+                    }
+                }
+            }
+        }
+    }
+    es = elasticsearch.Elasticsearch(["10.1.201.39"])
+    # Use scroll() api to return all entries in specified time range
+    result = helpers.scan(es, query=query, index="slurm")
+
+    print()
+    print("-" * 14, "Jobs ended in the last", last,"for", user, "-" * 14)
+    print(past_hdr_fmt.format("JOBID",
+                              "USER",
+                              "PARTITION",
+                              "CPUS",
+                              "STARTTIME",
+                              "ENDTIME",
+                              "STATE",
+                              "NODELIST"))
+    for item in result:
+        record = item["_source"]
+        startepoch = xml.utils.iso8601.parse(record.get("@start") + "Z")
+        endepoch = xml.utils.iso8601.parse(record.get("@end") + "Z")
+        startfmt = dt.fromtimestamp(startepoch).strftime("%Y-%m-%d %H:%M:%S")
+        endfmt = dt.fromtimestamp(endepoch).strftime("%Y-%m-%d %H:%M:%S")
+
+        print(past_hdr_fmt.format(record.get("jobid"),
+                                  record.get("username"),
+                                  record.get("partition"),
+                                  record.get("total_cpus"),
+                                  startfmt,
+                                  endfmt,
+                                  record.get("state"),
+                                  record.get("nodes")))
+    print()
+
+
+if __name__ == "__main__":
+    description = """Return a list of past jobs for a given user."""
+    epilog= """
+    Example time ranges:
+        2h  = last 2 hours (default)
+        12h = last 12 hours
+        3d  = last 3 days
+        2w  = last 2 weeks
+    """
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=description,
+        epilog=epilog
+    )
+    parser.add_argument("user", help="user to query")
+    parser.add_argument("-t", help="specify time range (default=2h)",
+                        default="2h", dest="last")
+    args = parser.parse_args()
+
+    try:
+        get_past_jobs(args.user, args.last)
+    except elasticsearch.exceptions.RequestError:
+        print("[Error]: You may have forgotten to specify a time unit, e.g. '4h' or '8d'.")
