@@ -10,8 +10,12 @@ import xml.utils.iso8601
 from datetime import datetime as dt
 
 import argparse
-import elasticsearch
-from elasticsearch import helpers
+try:
+    import elasticsearch
+    from elasticsearch import helpers
+except ImportError:
+    import sys
+    sys.exit("You need to install elasticsearch-py: https://elasticsearch-py.readthedocs.io/en/master/")
 
 past_hdr_fmt = "{0:>14} {1:>16} {2:>11} {3:>4} {4:>20} {5:>20} {6:>10} {7:>}"
 
