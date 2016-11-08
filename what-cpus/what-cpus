@@ -17,7 +17,11 @@ import sys
 from collections import defaultdict
 
 import argparse
-import psutil
+
+try:
+    import psutil
+except ImportError:
+    sys.exit("You need to install the python-psutil package or `pip install psutil`")
 
 
 def get_last_processor(pid):
