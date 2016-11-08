@@ -9,8 +9,15 @@ show-cluster-util
 
 import sys
 
-import hostlist
-import pyslurm
+try:
+    import hostlist
+except ImportError:
+    sys.exit("You need to install python-hostlist (pip install python-hostlist)")
+
+try:
+    import pyslurm
+except ImportError:
+    sys.exit("You need to install PySlurm: https://github.com/PySlurm/pyslurm")
 
 
 def human_readable(num, suffix="B"):
