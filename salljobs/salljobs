@@ -9,7 +9,11 @@ from collections import defaultdict
 from pwd import getpwnam, getpwuid
 
 import argparse
-import pyslurm
+
+try:
+    import pyslurm
+except ImportError:
+    sys.exit("You need to install PySlurm: https://github.com/PySlurm/pyslurm")
 
 # Print formatting for -u (by user)
 HEADER_FORMAT = "{0:>39}{1:>22}"
