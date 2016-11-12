@@ -1,0 +1,441 @@
+#!/usr/bin/python
+# vim: set ts=4 sw=4 et
+
+"""
+jobload - Output information about users' jobs and the nodes that these jobs
+          run on.
+"""
+
+import datetime
+import json
+import os
+import sys
+from collections import namedtuple
+from operator import attrgetter
+from pwd import getpwuid, getpwnam
+
+import argparse
+
+try:
+    import hostlist
+except ImportError:
+    sys.exit("You need to `pip install python-hostlist`.")
+
+try:
+    import pyslurm
+except ImportError:
+    sys.exit("You need to install PySlurm: https://github.com/PySlurm/pyslurm")
+
+try:
+    import redis
+except ImportError:
+    sys.exit("You need to install python-redis.")
+
+# Exit Values
+REDISCONN_ERR = 1
+PYSLURM_ERR = 2
+INVALID_NODE_ERR = 3
+NO_JOBS_RUNNING = 4
+
+# Global Variables
+average_load = []
+
+# Redis connection parameters
+REDISHOST = "192.168.1.2"
+REDISPORT = 6379
+REDISDB = 0
+REDISTIMEOUT = 1
+
+try:
+    # Initialize connection to Redis
+    redisconn = redis.StrictRedis(host=REDISHOST,
+                                  port=REDISPORT,
+                                  db=REDISDB,
+                                  password=None,
+                                  socket_timeout=REDISTIMEOUT)
+    # Do a quick ping or fail early, after socket timeout
+    redisconn.ping()
+except (redis.exceptions.ConnectionError,
+        redis.exceptions.TimeoutError,
+        redis.exceptions.ResponseError):
+    print "Jobload is temporarily unavailable."
+    print "Please try again in a few minutes."
+    sys.exit(REDISCONN_ERR)
+
+# Setup pyslurm job object early
+# It is used for querying nodes, jobids and users
+pyslurmjob = pyslurm.job()
+
+# output formatting
+linesingle = "{0:<1}{1:>15} {2:>11} / {3:>11} {4:>6} {5:>5} {6:>8} {7:>5.0f}%  {8:>6} / {9:>6} GB"
+linemulti = "{0:<1}{1:>27} / {2:>11} {3:>6} {4:>5} {5:>8} {6:>5.0f}%  {7:>6} / {8:>6} GB"
+summary = "{0:>23}{1:>5}{2:>9}{3:>5}{4:>11}{5:>4.0f}%"
+
+class JobloadError(Exception):
+    """Base-class for all exceptions raised by this module."""
+
+
+class JobStateError(JobloadError):
+    """Raised when job is not in the running state."""
+
+
+class InvalidJobError(JobloadError):
+    """Raised when job is jobid is not valid."""
+
+
+def bytes2gb(num):
+    """Convert bytes to gigabytes"""
+    if num == 0:
+        return "0.0"
+    else:
+        return "%.1f" % (num / (1024.0 * 1024.0 * 1024.0))
+
+
+def print_header(header_type, *args):
+    """ Print various headers. """
+
+    if header_type == "jobid_header":
+        jobid_header_format = "{0:>16} {1:>15} {2:>16} {3:>5} {4:>8} {5:>6} {6:>12}"
+        print jobid_header_format.format("JOBID",
+                                         "TIME",
+                                         "NODES",
+                                         "CPUS",
+                                         "THREADS",
+                                         "LOAD",
+                                         "MEMORY")
+
+        print "{0:>35}{1:>20}{2:>9}{3:>27}".format("Elapsed / Wall",
+                                                   "Alloc",
+                                                   "Active",
+                                                   "Used /     Alloc")
+
+    if header_type == "node_jobs_plural":
+        jobs_on_node = args
+        print ""
+        print "There are %s jobs running on this node.\n" % jobs_on_node
+
+    if header_type == "node_jobs_singular":
+        print ""
+        print "There is 1 job running on this node.\n"
+
+    if header_type == "node_header":
+        print "{0:<22}{1:>13}{2:>10}{3:>11}{4:>12}".format("USER",
+                                                           "JOBID",
+                                                           "NODECPUS",
+                                                           "TOTALCPUS",
+                                                           "TOTALNODES")
+
+
+def process_node(args):
+    """Show all job and node information for a given node."""
+    node = args.node
+    verbose = args.verbose
+
+    try:
+        alljobs = pyslurmjob.get()
+    except ValueError as error:
+        print 'Query failed - %s' % error
+        sys.exit(PYSLURM_ERR)
+
+    if verbose >= 1:
+        try:
+            pyslurmnode = pyslurm.node()
+            nodeinfo = pyslurmnode.find_id(node)
+        except ValueError as error:
+            print 'Query failed - %s' % error
+            sys.exit(PYSLURM_ERR)
+        else:
+            print "\nNODE:\t", node
+            print ""
+            print "\t{0:<20}{1}{2}".format("Features", " : ",
+                                           nodeinfo['features'])
+            print "\t{0:<20}{1}{2}".format("Node State", " : ",
+                                           nodeinfo['state'])
+
+            if nodeinfo['reason'] is not None:
+                print "\t{0:<20}{1}{2}".format("Reason", " : ",
+                                               nodeinfo['reason'])
+                print "\t{0:<20}{1}{2}".format("Reason Time", " : ",
+                    pyslurm.epoch2date(nodeinfo['reason_time']))
+
+            print "\t{0:<20}{1}{2}".format("Total CPUs", " : ",
+                                           nodeinfo['cpus'])
+            print "\t{0:<20}{1}{2}".format("Socket(s)", " : ",
+                                           nodeinfo['sockets'])
+            print "\t{0:<20}{1}{2}".format("Core(s) per socket", " : ",
+                                           nodeinfo['cores'])
+            print "\t{0:<20}{1}{2}".format("Thread(s) per core", " : ",
+                                           nodeinfo['threads'])
+            print "\t{0:<20}{1}{2}".format("Total Real Memory", " : ",
+                                           str(nodeinfo['real_memory']) + " MB")
+            print "\t{0:<20}{1}{2}".format("Slurmd Version", " : ",
+                                           nodeinfo['version'])
+            print "\t{0:<20}{1}{2}".format("Slurmd Start Time", " : ",
+                pyslurm.epoch2date(nodeinfo['slurmd_start_time']))
+            print "\t{0:<20}{1}{2}".format("Last boot time", " : ",
+                pyslurm.epoch2date(nodeinfo['boot_time']))
+
+    Job = namedtuple('Job',
+                     ['jobid', 'user', 'node_cpus', 'total_cpus', 'total_nodes'])
+
+    jobs_on_this_node = []
+
+    for jobid, values in alljobs.iteritems():
+        cpu_alloc = values['cpus_allocated'].get(node, None)
+        if cpu_alloc:
+            jobs_on_this_node.append(Job(jobid,
+                                         values['user_id'],
+                                         values['cpus_allocated'][node],
+                                         values['num_cpus'],
+                                         values['num_nodes']
+                                        )
+                                    )
+
+    jobs_on_this_node.sort(key=attrgetter('jobid', 'user'))
+
+    # TODO: Change output here. Num CPUs should reflect CPUs used on _this_ node.
+    #       Num Nodes should be nodelist.
+    # TODO: Add Alloc Memory used on _this_ node.
+    # TODO: Check to make sure only RUNNING jobs are printed
+
+    # If there are jobs, print them
+    if jobs_on_this_node:
+        if len(jobs_on_this_node) > 1:
+            print_header("node_jobs_plural", len(jobs_on_this_node))
+        else:
+            print_header("node_jobs_singular")
+
+        print_header("node_header")
+
+        for job in jobs_on_this_node:
+            try:
+                this_user = getpwuid(job.user)[0]
+            except:
+                this_user = "nobody"
+            print "{0:<22}{1:>13}{2:>10}{3:>11}{4:>12}".format(this_user,
+                                                               job.jobid,
+                                                               job.node_cpus,
+                                                               job.total_cpus,
+                                                               job.total_nodes)
+        print ""
+    else:
+        print ""
+        print "There are no jobs on running on this node."
+        sys.exit(NO_JOBS_RUNNING)
+
+
+def get_jobid_from_redis(jobinfo):
+    """ Get jobid information from Redis and return in json format. """
+    redis_output = {}
+
+    if jobinfo:
+        jobid = jobinfo.get("job_id")
+        nodelist = jobinfo.get("nodes")
+        walltime = jobinfo.get("time_limit_str")
+        runtime = jobinfo.get("run_time_str")
+        interactive = jobinfo.get("batch_flag")
+        job_state = jobinfo.get("job_state")
+    else:
+        return None
+
+    if job_state != "RUNNING":
+        return None
+
+    if interactive == 0:
+        interactive = "i"
+    else:
+        interactive = ""
+
+    for node in hostlist.expand_hostlist(nodelist):
+        # Get node information from Redis
+        try:
+            node_redis_info = json.loads(redisconn.get(node))
+        except (redis.exceptions.ConnectionError,
+                redis.exceptions.TimeoutError,
+                redis.exceptions.ResponseError):
+            print "Jobload is temporarily unavailable."
+            print "Please try again in a few minutes."
+            sys.exit(REDISCONN_ERR)
+        else:
+            total_logical_cpus = node_redis_info["total_logical_cpus"]
+            system_load = node_redis_info["load"]
+
+        # Get job information from the output of Redis above
+        all_node_jobs = node_redis_info.get("jobs", None)
+
+        job_mem_usage = 0
+        job_mem_alloc = 0
+        job_cpu_and_procs = []
+        job_num_threads = 0
+
+        if all_node_jobs:
+            this_job_info = node_redis_info.get("jobs").get(str(jobid), None)
+
+            if this_job_info is not None:
+                try:
+                    job_mem_usage = this_job_info["mem_usage"]
+                    job_mem_alloc = this_job_info["mem_alloc"]
+                    job_cpu_and_procs = this_job_info["cpu_and_procs"]
+                    job_num_threads = this_job_info["active_threads"]
+                except (KeyError, ValueError):
+                    pass
+
+        redis_output.update({node:
+                              {"run_time": runtime,
+                               "wall_time": walltime,
+                               "interactive": interactive,
+                               "alloc_cpus": len(job_cpu_and_procs),
+                               "num_threads": job_num_threads,
+                               "load": system_load,
+                               "mem_used": job_mem_usage,
+                               "mem_alloc": job_mem_alloc
+                               }
+                            })
+    return redis_output
+
+
+def display_jobid(jobid, job_redis_info, job_slurm_info, *args):
+
+    average_job_load = []
+
+    if job_slurm_info and job_slurm_info["array_job_id"] is not None:
+        jobid = str(job_slurm_info["array_job_id"]) + "_" + \
+                str(job_slurm_info["array_task_id"])
+
+    job_redis_info_sorted = sorted(job_redis_info)
+
+    if job_redis_info_sorted:
+        for linenum, node in enumerate(job_redis_info_sorted, 1):
+            values = job_redis_info.get(node)
+            try:
+                alloc_cpu_load = (100 * float(values["num_threads"]) /
+                                        float(values["alloc_cpus"]))
+            except ZeroDivisionError:
+                alloc_cpu_load = 0
+            finally:
+                if linenum == 1:
+                    print linesingle.format(
+                        values["interactive"],
+                        jobid,
+                        str(values["run_time"]),
+                        str(values["wall_time"]),
+                        node,
+                        values["alloc_cpus"],
+                        values["num_threads"],
+                        alloc_cpu_load,
+                        bytes2gb(int(values["mem_used"])),
+                        bytes2gb(int(values["mem_alloc"]))
+                    )
+                else:
+                    print linemulti.format(
+                        values["interactive"],
+                        str(values["run_time"]),
+                        str(values["wall_time"]),
+                        node,
+                        values["alloc_cpus"],
+                        values["num_threads"],
+                        alloc_cpu_load,
+                        bytes2gb(int(values["mem_used"])),
+                        bytes2gb(int(values["mem_alloc"]))
+                    )
+
+                average_load.append(alloc_cpu_load)
+                average_job_load.append(alloc_cpu_load)
+
+        if linenum > 1 :
+            print summary.format("Nodes:", job_slurm_info["num_nodes"],
+                                 "CPUs:", job_slurm_info["num_cpus"],
+                                 "Load Avg:", sum(average_job_load) /
+                                                  len(average_job_load))
+
+
+def process_job(jobid, user):
+    try:
+        job_slurm_info = pyslurmjob.find_id(jobid)
+    except ValueError:
+        sys.exit("Invalid job id specified")
+    else:
+        print_header("jobid_header")
+        for jobdict in job_slurm_info:
+            job_redis_info = get_jobid_from_redis(jobdict)
+            if job_redis_info is not None:
+                display_jobid(jobid, job_redis_info, jobdict)
+
+
+def process_user(user):
+    try:
+        # Get list of jobids for the given user
+        user_jobs = pyslurmjob.find_user(user)
+    except KeyError:
+        sys.exit("Invalid user.")
+    else:
+        if user_jobs:
+            print_header("jobid_header")
+
+            total_jobs = 0
+            total_cpus = 0
+            nodelist = set()
+
+            for jobid, job_slurm_info in sorted(user_jobs.items()):
+                try:
+                    if job_slurm_info["job_state"] == "RUNNING":
+                        job_redis_info = get_jobid_from_redis(job_slurm_info)
+                        display_jobid(jobid, job_redis_info, job_slurm_info)
+                        total_jobs += 1
+                        total_cpus += job_slurm_info["num_cpus"]
+                        nodes = job_slurm_info["nodes"]
+
+                        for node in hostlist.expand_hostlist(nodes):
+                            nodelist.add(node)
+                except (JobStateError, InvalidJobError):
+                    continue
+                except (KeyError, TypeError):
+                    continue
+
+            if total_jobs == 0:
+                print "User", user, "has no running jobs."
+                sys.exit(NO_JOBS_RUNNING)
+
+            print ""
+            print "USER SUMMARY"
+            print "     Jobs: %s" % total_jobs,
+            print "     Nodes: %s" % len(nodelist),
+            print "     CPUs: %s" % total_cpus,
+
+            if not average_load:
+                print "     Load Avg: 0%"
+            else:
+                print "     Load Avg: %.0f%%" % (sum(average_load) /
+                                                 len(average_load))
+            print ""
+        else:
+            print "User", user, "has no running jobs."
+
+
+if __name__ == "__main__":
+
+    description = """Query job information by user, jobid or node.
+                     If no arguments are used, jobload will show job
+                     information for the current user."""
+
+    parser = argparse.ArgumentParser(description=description)
+    group = parser.add_mutually_exclusive_group(required=False)
+    group.add_argument("-u", help="query jobs by user", dest="user")
+    group.add_argument("-j", help="query jobs by jobid", dest="jobid")
+    group.add_argument("-n", help="query jobs by node", dest="node")
+    parser.add_argument("-v", help="increase output verbosity",
+                        action="count", default=0, dest="verbose")
+    args = parser.parse_args()
+
+
+    # Instructions to process command line options
+    if args.user:
+        process_user(args.user)
+    elif args.jobid:
+        process_job(args.jobid, args.user)
+    elif args.node:
+        process_node(args)
+    else:
+        user = os.environ.get("USER")
+        if user != "root":
+            process_user(user)
