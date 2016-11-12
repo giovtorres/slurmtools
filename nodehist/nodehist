@@ -1,0 +1,177 @@
+#!/usr/bin/python
+
+"""
+nodehist - Report current and completed jobs on a given node
+"""
+
+from __future__ import print_function
+
+import json
+import sys
+from collections import namedtuple
+
+sys.path.insert(0, "/usr/local/lib64/python")
+sys.path.insert(1, "/usr/local/pyslurm/15.08.8/lib64/python2.6/site-packages")
+
+import argparse
+import hostlist
+import pyslurm
+import redis
+from elasticsearch import Elasticsearch
+from elasticsearch import helpers
+from redis_constants import *
+
+__author__ = "Giovanni Torres"
+__email__ = "torresgi@helix.nih.gov"
+__date__ = "Thu Apr 21 10:51:57 EDT 2016"
+
+
+running_hdr_fmt = "{0:>14} {1:>16} {2:>10} {3:>4} {4:>12}"
+past_hdr_fmt = "{0:>14} {1:>16} {2:>10} {3:>4} {4:>20} {5:>20} {6:>10}"
+
+
+def get_running_jobs_on_node(node):
+    """Show all RUNNING jobs on a given node.
+
+    Get the running jobs on a given node from the Redis database instead of
+    from Slurm.  This is faster, as Slurm doesn't have a native way of getting
+    just jobs on a node without iterating over all running jobs and checking
+    the intersection of nodelist and node.
+    """
+    try:
+        redisconn = redis.StrictRedis(host=REDISHOST,
+                                      port=REDISPORT,
+                                      db=REDISDB,
+                                      password=REDISAUTH,
+                                      socket_timeout=REDISTIMEOUT)
+    except (redis.exceptions.ConnectionError,
+            redis.exceptions.TimeoutError,
+            redis.exceptions.ResponseError):
+        print("Nodehist is temporarily unavailable.")
+        print("Please try again in a few minutes.")
+        sys.exit(1)
+    else:
+        nodeinfo = redisconn.get(node)
+        if nodeinfo is None:
+            print("Is this node up?")
+        else:
+            print("-" * 14, "Currently Running Jobs on", node, "-" * 14)
+            print(running_hdr_fmt.format("JOBID",
+                                         "USER",
+                                         "PARTITION",
+                                         "CPUS",
+                                         "RUNTIME"))
+            nodeinfo = json.loads(nodeinfo)
+            if nodeinfo.get("jobs") is not None:
+                jobs = nodeinfo.get("jobs")
+                for job, jobinfo in jobs.items():
+                    jobslurminfo = get_slurm_info(job, node)
+                    print(running_hdr_fmt.format(job,
+                                                 jobinfo["user"],
+                                                 jobslurminfo.partition,
+                                                 jobslurminfo.cpus_alloc,
+                                                 jobslurminfo.runtime))
+
+            else:
+                print("There are no RUNNING jobs on this node.")
+
+
+def get_slurm_info(jobid, node):
+    """Get jobinfo from PySlurm for a given jobid.
+
+    For a given jobid, return a namedtuple of the partition, runtime and cpus
+    allocated.  This is done via PySlurm.
+    """
+    jobinfo = pyslurm.job().find_id(int(jobid))
+    Job = namedtuple("Job", ["partition", "cpus_alloc", "runtime"])
+    partition = jobinfo.get("partition")
+    cpus_alloc = jobinfo.get("cpus_allocated").get(node)
+    runtime = jobinfo.get("run_time_str")
+    return Job(partition, cpus_alloc, runtime)
+
+
+def get_past_jobs_on_node(node, last):
+    """Get past jobs from Elasticsearch.
+
+    Use Elasticsearch API to get all completed jobs.  Since the JobComp plugin
+    stores the nodes for a job as a nodelist, this query needs to first get all
+    jobs in a given time range, iterate over it, expand each hostlist and check
+    to see if the given node is in the hostlist.
+    """
+    query = {
+        "query": {
+            "filtered": {
+                "filter": {
+                    "bool": {
+                        "must": [
+                            {
+                                "range": {
+                                    "@end": {
+                                        "gt": "now-" + last
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                },
+                "query": {
+                    "query_string": {
+                        "analyze_wildcard": True,
+                        "query": "*"
+                    }
+                }
+            }
+        }
+    }
+    es = Elasticsearch(["10.1.201.39"])
+    # Use scroll() api to return all entries in specified time range
+    result = helpers.scan(es, query=query, index="slurm")
+
+    print("-" * 14, "Jobs ended in the last", last,"on", node, "-" * 14)
+    print(past_hdr_fmt.format("JOBID",
+                              "USER",
+                              "PARTITION",
+                              "CPUS",
+                              "STARTTIME",
+                              "ENDTIME",
+                              "STATE"))
+    for item in result:
+        record = item["_source"]
+        if record.get("total_nodes") == 0:
+            # Ignore some CANCELLED jobs
+            pass
+        else:
+            # Get nodelist.  Some jobs are multinode jobs.
+            nodelist = record.get("nodes")
+            if node in hostlist.expand_hostlist(nodelist):
+                print(past_hdr_fmt.format(record.get("jobid"),
+                                          record.get("username"),
+                                          record.get("partition"),
+                                          record.get("total_cpus"),
+                                          record.get("@start"),
+                                          record.get("@end"),
+                                          record.get("state")))
+
+
+if __name__ == "__main__":
+    description = """Return a list of current and past jobs on a given node."""
+    epilog= """
+    Example time ranges:
+        2h  = last 2 hours (default)
+        12h = last 12 hours
+        3d  = last 3 days
+        2w  = last 2 weeks
+    """
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=description,
+        epilog=epilog
+    )
+    parser.add_argument("node", help="node to query")
+    parser.add_argument("-t", help="specify time range (default=2h)",
+                        default="2h", dest="last")
+    args = parser.parse_args()
+
+    get_running_jobs_on_node(args.node)
+    print()
+    get_past_jobs_on_node(args.node, args.last)
