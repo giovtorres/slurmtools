@@ -54,6 +54,12 @@ For CPUs and or Memory, the various states are defined as follows:
 | Eligible | CPUs or Memory that belong to nodes not in the DOWN or DRAINED states |
 | Configured | CPUs or Memory that belong to all nodes regardless of state |
 
+## Configuration
+
+If you have overlapping partitions, you should configure the
+`OVERLAPPING_PARTITIONS` list in the script so that nodes do not get counted
+twice.
+
 ## License
 
 This project is in the worldwide public domain.  See [LICENSE](../LICENSE.md) for

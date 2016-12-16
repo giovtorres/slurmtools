@@ -19,6 +19,12 @@ try:
 except ImportError:
     sys.exit("You need to install PySlurm: https://github.com/PySlurm/pyslurm")
 
+# Overlapping partitions are those that may have nodes in multiple partitions.
+# For example, an "interactive" partition could include nodes from the "normal"
+# and "gpu" partitions.  However, you wouldn't want the nodes to get counted
+# twice.  Therefore, exclude these partitions here. Default is an empty list.
+#OVERLAPPING_PARTITIONS = ["interactive", "quick", "maint"]
+OVERLAPPING_PARTITIONS = []
 
 def human_readable(num, suffix="B"):
     """Convert bytes to a human readable form"""
@@ -40,7 +46,7 @@ def get_part_info():
     for part, partinfo in all_parts.items():
         defmempercpu[part] = partinfo["def_mem_per_cpu"]
         nodes = hostlist.expand_hostlist(partinfo["nodes"])
-        if part not in ["interactive", "quick", "maint"]:
+        if part not in OVERLAPPING_PARTITIONS:
             for node in nodes:
                 all_nodes[node] = part
 
