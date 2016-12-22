@@ -125,12 +125,10 @@ def get_util(nodes):
                     all_metrics["total_cpus_idle"] += cpus_total - cpus_alloc
                     all_metrics["total_memory_alloc"] += memory_alloc
                     all_metrics["total_memory_idle"] += memory_real - memory_alloc
-            elif "IDLE" in state:
+            elif ("IDLE" in state) or ("RESERVED" in state):
                 all_metrics["total_nodes_idle"] += 1
                 all_metrics["total_cpus_idle"] += cpus_total
                 all_metrics["total_memory_idle"] += memory_real
-            else:
-                print node
 
 
     assert all_metrics["total_nodes_alloc"] + \
