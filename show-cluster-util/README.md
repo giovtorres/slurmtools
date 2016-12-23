@@ -10,6 +10,17 @@ break it down by various states for the nodes as well as CPU and Memory.
 [hostlist](https://www.nsc.liu.se/~kent/python-hostlist/) and
 [PySlurm](https://github.com/PySlurm/pyslurm) Python modules.
 
+## Configuration
+
+If you have overlapping partitions, you should configure the
+`OVERLAPPING_PARTITIONS` list in the script so that nodes do not get counted
+twice.
+
+## Usage
+
+`show-cluster-util` will report cluster utilization across all configured
+nodes in all partitions.  Use the `-p` flag to specify a partition.
+
 ## Example Output
 ```
 $ show-cluster-util
@@ -53,12 +64,6 @@ For CPUs and or Memory, the various states are defined as follows:
 | Overallocated | Memory that Slurm has overallocated to one or more jobs on a node.  In this case, allocated memory on the node is greater than the configured real memory |
 | Eligible | CPUs or Memory that belong to nodes not in the DOWN or DRAINED states |
 | Configured | CPUs or Memory that belong to all nodes regardless of state |
-
-## Configuration
-
-If you have overlapping partitions, you should configure the
-`OVERLAPPING_PARTITIONS` list in the script so that nodes do not get counted
-twice.
 
 ## License
 
