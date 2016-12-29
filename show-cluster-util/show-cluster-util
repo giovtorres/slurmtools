@@ -9,6 +9,7 @@ show-cluster-util
 
 import argparse
 import sys
+from collections import defaultdict
 
 try:
     import hostlist
@@ -24,8 +25,16 @@ except ImportError:
 # For example, an "interactive" partition could include nodes from the "normal"
 # and "gpu" partitions.  However, you wouldn't want the nodes to get counted
 # twice.  Therefore, exclude these partitions here. Default is an empty list.
-#OVERLAPPING_PARTITIONS = ["interactive", "quick", "maint"]
+#OVERLAPPING_PARTITIONS = ["interactive", "short"]
 OVERLAPPING_PARTITIONS = []
+
+# Add GPU partitions to the list to report GPU allocation usage
+#GPU_PARTITIONS = ["gpuk40x", "gpuk80x"]
+GPU_PARTITIONS = []
+
+# Line formats
+fmt1 = "{0:<36} : {1:>8}"
+fmt2 = "{0:<36} : {1:>7}%"
 
 def human_readable(num, suffix="B"):
     """Convert bytes to a human readable form"""
@@ -161,8 +170,6 @@ def display_metrics(metrics, part_name):
     else:
         title = "Cluster"
 
-    fmt1 = "{0:<36} : {1:>8}"
-    fmt2 = "{0:<36} : {1:>7}%"
     print fmt1.format("Total Allocated Nodes", metrics["total_nodes_alloc"])
     print fmt1.format("Total Mixed Nodes", metrics["total_nodes_mixed"])
     print fmt1.format("Total Idle Nodes", metrics["total_nodes_idle"])
@@ -237,6 +244,43 @@ def display_metrics(metrics, part_name):
     print ""
 
 
+def get_gpu_util(nodes, gpupart=None):
+    """
+    """
+    gpu_usage = defaultdict(lambda: defaultdict(int))
+
+    if gpupart is not None:
+        gpupartlist = [gpupart]
+    else:
+        gpupartlist = GPU_PARTITIONS
+
+    for part in gpupartlist:
+        nodelist = pyslurm.partition().find_id(part).get("nodes")
+        nodes_in_part = hostlist.expand_hostlist(nodelist)
+
+        for node in nodes_in_part:
+            gres_avail = [g for g in nodes.get(node).get("gres") if "gpu" in g]
+            gpu_usage[part]["avail"] += int(gres_avail[0].split(":")[-1])
+
+            gres_used = [g for g in nodes.get(node).get("gres_used") if "gpu" in g]
+            gpu_usage[part]["used"] += int(gres_used[0].split(":")[-1])
+
+    return gpu_usage
+
+
+def display_gpu_metrics(gpu_metrics):
+    """
+    """
+    print "GPU Utilization"
+    print 15 * "-"
+    for item in gpu_metrics.items():
+        print "{0:<36} : {1:>8} {2}".format(
+            item[0],
+            str(item[1]["used"]) + "/" + str(item[1]["avail"]),
+            "(Used/Avail)"
+        )
+
+
 if __name__ == "__main__":
     # Set up command line arguments
     description = "Query cluster utilization"
@@ -264,3 +308,11 @@ if __name__ == "__main__":
 
     metrics = get_util(nodes)
     display_metrics(metrics, args.part)
+
+    if GPU_PARTITIONS:
+        if not args.part:
+            gpu_metrics = get_gpu_util(nodes)
+            display_gpu_metrics(gpu_metrics)
+        elif args.part[0] in GPU_PARTITIONS:
+            gpu_metrics = get_gpu_util(nodes, args.part[0])
+            display_gpu_metrics(gpu_metrics)

@@ -16,6 +16,9 @@ If you have overlapping partitions, you should configure the
 `OVERLAPPING_PARTITIONS` list in the script so that nodes do not get counted
 twice.
 
+To enable GPU allocation usage, configure the `GPU_PARTITIONS` list in the
+script.
+
 ## Usage
 
 `show-cluster-util` will report cluster utilization across all configured
@@ -50,6 +53,10 @@ Total Eligible Memory             : 126.4 TB
 Total Configured Memory           : 134.0 TB
 Cluster Memory % Unallocatable    :      32%
 Cluster Memory % (Alloc + Unalloc):      80%
+
+GPU Utilization
+---------------
+gpupart                           :    29/48 (Used/Avail)
 
 ```
 
