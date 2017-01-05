@@ -96,7 +96,6 @@ def get_util(nodes):
         cpus_total = nodeinfo.get("cpus")
         memory_alloc = nodeinfo.get("alloc_mem")
         memory_real = nodeinfo.get("real_memory")
-        shared = nodeinfo.get("shared")
 
         all_metrics["total_nodes_config"] += 1
         all_metrics["total_cpus_config"] += cpus_total
@@ -109,7 +108,7 @@ def get_util(nodes):
         else:
             all_metrics["total_cpus_alloc"] += cpus_alloc
 
-            if ("ALLOCATED" in state) or (shared == 0):
+            if ("ALLOCATED" in state):
                 all_metrics["total_nodes_alloc"] += 1
                 all_metrics["total_cpus_unalloc"] += cpus_total - cpus_alloc
                 if memory_alloc > memory_real:
