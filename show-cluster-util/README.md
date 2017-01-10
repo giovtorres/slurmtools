@@ -12,65 +12,56 @@ break it down by various states for the nodes as well as CPU and Memory.
 
 ## Configuration
 
-If you have overlapping partitions, you should configure the
-`OVERLAPPING_PARTITIONS` list in the script so that nodes do not get counted
-twice.
+Configuration is done by modifying the configuration section of the script.
+There are three variables that can be adapted to the cluster setup:
 
-To enable GPU allocation usage, configure the `GPU_PARTITIONS` list in the
-script.
+- `EXCLUDED_PARTITIONS`: excluded partitions are not included in any output
+- `PARTITION_GROUPS`: Nodes can be assigned to one (and only one) group depending
+  on which partition they belong to. Output can be split up by group. See the script
+  for more details
+- `GRES`: Used to configure gres to to include in the output. A list of 2-element
+  lists, each containing the name of a gres and the unit in which it is measured
+  by slurm ("count", "MB", "GB", or "TB").
+
 
 ## Usage
 
-`show-cluster-util` will report cluster utilization across all configured
-nodes in all partitions.  Use the `-p` flag to specify a partition.
+`show-cluster-util` will report cluster utilization across all configured nodes
+in all partitions.  Use the `-p` flag (once or multiple times) to specify a
+partition and the (mutually exclusive) -g to split the output by node groups.
 
 ## Example Output
 ```
 $ show-cluster-util
 
-Total Allocated Nodes             :      858
-Total Mixed Nodes                 :      526
-Total Idle Nodes                  :      490
-Total Down/Offline Nodes          :      251
-Total Eligible Nodes              :     1874
-Total Configured Nodes            :     2125
+================================== All Nodes ===================================
+  ALLOCATED |        IDLE |       MIXED |        DOWN |       TOTAL
+  1240  40% |    952  31% |    624  20% |    274   9% |        3090
+================================================================================
 
-Total Allocated CPUs              :    31060
-Total Idle CPUs                   :    15628
-Total Down CPUs                   :     5596
-Total Unallocatable CPUs          :     1220
-Total Eligible CPUs               :    47908
-Total Configured CPUs             :    53504
-Cluster CPU % Unallocatable       :       2%
-Cluster CPU % (Alloc + Unalloc)   :      67%
-
-Total Allocated Memory            :  60.7 TB
-Total Idle Memory                 :  25.0 TB
-Total Down Memory                 :   7.6 TB
-Total Unallocatable Memory        :  40.6 TB
-Total Overallocated Memory        :  14.3 GB
-Total Eligible Memory             : 126.4 TB
-Total Configured Memory           : 134.0 TB
-Cluster Memory % Unallocatable    :      32%
-Cluster Memory % (Alloc + Unalloc):      80%
-
-GPU Utilization
----------------
-gpupart                           :    29/48 (Used/Avail)
+                cpu             mem             gpu        lscratch     
+         ----------      ----------      ----------      ----------     
+idle          34004  31%    76.7 TB  20%        107  79%   337.3 TB  27%
+alloc         74038  67%   168.7 TB  43%         27  20%   196.3 TB  16%
+unavail        2190   2%   147.6 TB  38%          2   1%   712.5 TB  57%
+         ----------      ----------      ----------      ----------     
+usable       110232        392.9 TB             136          1.2 PB     
+down          11232         38.1 TB               8         96.3 TB     
+         ----------      ----------      ----------      ----------     
+total        121464        431.1 TB             144          1.3 PB     
 
 ```
 
-For CPUs and or Memory, the various states are defined as follows:
+The states are defined as follows:
 
 | State | Description |
 | ----- | ----------- |
-| Allocated | CPUs or Memory that have been requested and allocated by user jobs |
-| Idle | CPUs or Memory that are not allocated and available to newly submitted jobs | 
-| Down/Offline | CPUs or Memory that belong to nodes that are in the DOWN or DRAINED states |
-| Unallocatable | CPUs or Memory that are unused but not available to newly submitted jobs due the way jobs have allocated resources on the node |
-| Overallocated | Memory that Slurm has overallocated to one or more jobs on a node.  In this case, allocated memory on the node is greater than the configured real memory |
-| Eligible | CPUs or Memory that belong to nodes not in the DOWN or DRAINED states |
-| Configured | CPUs or Memory that belong to all nodes regardless of state |
+| Allocated | Resources that have been requested and allocated by user jobs |
+| Idle | Resources that are not allocated and available to newly submitted jobs | 
+| Down | Resources that belong to nodes that are in the DOWN or DRAINED states |
+| Unavailable | Resources that are unused but not available to newly submitted jobs due the way jobs have allocated resources on the node |
+| Usable | Resouces that belong to nodes not in the DOWN or DRAINED states |
+| Total | All resouces regardless of state |
 
 ## License
 
