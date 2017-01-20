@@ -24,16 +24,19 @@ partition(s).
 ## Example
 
 ```
-                           RUNNING/USED     PENDING/REQUESTED
-                      -----------------     -----------------
-            USERNAME   CPUS NODES  JOBS      CPUS NODES  JOBS
-               user1    928    29     2         0     0     0
-         	   user2     36     3     3         0     0     0
-               user3   3008   102     3      1504    70     2
-			   ...
-                      -----------------     -----------------
-               TOTAL  31926  1403  4362      9919   854  1401
-           AVAILABLE  53472  2178 
+                             RUNNING                PENDING    
+                     -----------------------    ---------------
+            USERNAME    CPUS   NODES    JOBS       CPUS    JOBS
+               user1    1120      20       2          0       0
+               user2     288       9       9          0       0
+               user3    3194      81      26        100       1
+               [...]
+                     -----------------------    ---------------
+               TOTAL   72000    1808   10706      30380    1170
+           AVAILABLE  108840    2789                           
+
+The number of CPUs for PENDING jobs is a minimal estimate.
+Actual allocation may be different.
 ```
 
 ## License
