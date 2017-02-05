@@ -1,317 +1,415 @@
 #!/usr/bin/python
 
 """
-show-cluster-util
+DESCRIPTION
+    show-cluster-util uses the Python SLURM bindings to get cluster utilization.
+    It distinguishes between resources that are free and available and
+    resources that are free but not available for allocation (unavail). The
+    latter occurs when either CPU or memory allocation on a node prevents 
+    further jobs of the smallest default allocation for that node from
+    being scheduled while there are still all CPUs on a node are allocated 
+    but there is still memory available or vice versa. This also applies
+    to gres on those nodes.
 
-    This script uses the Python Slurm bindings to get cluster utilization.
-    It accounts for nodes being allocated exclusively or fully allocated.
+CONFIGURATION
+    Configuration of the following parameters is done by modifying the
+    CONFIG section of the script itself
 """
 
-import argparse
+##########################################################################
+#                                IMPORTS                                 #
+##########################################################################
+
 import sys
+import argparse
 from collections import defaultdict
 
 try:
     import hostlist
 except ImportError:
-    sys.exit("You need to install python-hostlist (pip install python-hostlist)")
+    die("This tool requires python-hostlist")
 
+sys.path.insert(0, "/usr/local/pyslurm/latest/lib64/python2.6/site-packages")
 try:
     import pyslurm
 except ImportError:
-    sys.exit("You need to install PySlurm: https://github.com/PySlurm/pyslurm")
-
-# Overlapping partitions are those that may have nodes in multiple partitions.
-# For example, an "interactive" partition could include nodes from the "normal"
-# and "gpu" partitions.  However, you wouldn't want the nodes to get counted
-# twice.  Therefore, exclude these partitions here. Default is an empty list.
-#OVERLAPPING_PARTITIONS = ["interactive", "short"]
-OVERLAPPING_PARTITIONS = []
-
-# Add GPU partitions to the list to report GPU allocation usage
-#GPU_PARTITIONS = ["gpuk40x", "gpuk80x"]
-GPU_PARTITIONS = []
-
-# Line formats
-fmt1 = "{0:<36} : {1:>8}"
-fmt2 = "{0:<36} : {1:>7}%"
-
-def human_readable(num, suffix="B"):
-    """Convert bytes to a human readable form"""
-    if num == 0:
-        return "0.0 GB"
-    else:
-        for unit in ['', 'K', 'M', 'G', 'T', 'P']:
-            if abs(num) < 1024.0:
-                return "%.1f %s%s" % (num, unit, suffix)
-            num /= 1024.0
+    die("This tool requires pyslurm")
 
 
-def get_part_info():
-    """Return dictionary of defmempercpu limits."""
+##########################################################################
+#                                 CONFIG                                 #
+##########################################################################
+# purely floating partitions should be excluded
+EXCLUDED_PARTITIONS = ["maint", "interactive"]
+
+# nodes can be assigned to different groups for separate reporting based
+# on their partition. The first group that matches will be assigned to
+# the node. That means groups are mutually exclusive. Nodes not falling
+# into one of the groups are put into the automatic "other" group.
+# If PARTITION_GROUPS is [], nodes cannot be split out into
+# separate groups.
+# EXAMPLE:
+#   PARTITION_GROUPS = [ 
+#        ["Old Nodes", ["old1", "old2"]],
+#        ["New Nodes", ["new1", "new2", "new3"]]]
+PARTITION_GROUPS = []
+
+# this is tuples of (gres_name, unit). Allowed units are "count",
+# "MB", "GB", "TB". Only gres names listed here are tracked (in
+# addition to the default memory and cpu)
+# EXAMPLE:
+#   GRES = [("gpu", "count"),
+#           ("lscratch", "GB")]
+GRES = []
+
+##########################################################################
+#                                CLASSES                                 #
+##########################################################################
+
+
+class Node(object):
+    """Simple data bucket for node attributes; internally quantities
+    measuring memory are stored as MB."""
+    groups = [(a, set(b)) for a, b in PARTITION_GROUPS]
+    gres = GRES
+    unit_factor = {"count": 1,
+                   "MB": 1.0,
+                   "GB": 1024.0,
+                   "TB": 1048576.0}
+
+    def __init__(self, name):
+        self.name = name
+        self.part = set([])
+        self._group = None
+        self.defmempercpu = None
+
+        self.state = None
+        self.res = {}  # resources
+        self.can_run_another_job = None
+
+    def add_part(self, part):
+        """
+        add new partition to set of partitions this node
+        belongs to
+        """
+        self.part.add(part)
+
+    def update_defmempercpu(self, dmpc):
+        """
+        set defmempercpu to the minimum of current
+        defmempercpu and dmpc
+        """
+        if self.defmempercpu is None:
+            self.defmempercpu = dmpc
+        else:
+            self.defmempercpu = min(self.defmempercpu, dmpc)
+
+    def set_state(self, nodeinfo):
+        """
+        use node dict returned by pyslurm.node.get to update the
+        state of the node (resources available and allocated)
+        """
+        # clean up the node state; this should take care of
+        # states like "DOWN*", "MIXED+DRAIN", ...
+        rawstate = nodeinfo["state"].strip().upper()
+        if "DRAIN" in rawstate or "DOWN" in rawstate:
+            self.state = "DOWN"
+        elif "IDLE" in rawstate:
+            self.state = "IDLE"
+        elif "MIXED" in rawstate:
+            self.state = "MIXED"
+        elif "ALLOCATED" in rawstate:
+            self.state = "ALLOCATED"
+        else:
+            die("Bad state '{0}' for node '{1}'".format(rawstate, self.name))
+
+        self.res["cpu"] = {
+                "alloc": nodeinfo["alloc_cpus"],
+                "total": nodeinfo["cpus"]
+                }
+        # slurm returns memory in MB - no conversion required
+        self.res["mem"] = {
+                "alloc": nodeinfo["alloc_mem"],
+                "total": nodeinfo["real_memory"]
+                }
+
+        gres_total = dict(parse_gres(a) for a in nodeinfo["gres"])
+        gres_alloc = dict(parse_gres(a) for a in nodeinfo["gres_used"])
+        for gresname, gresunit in self.gres:
+            uf = self.unit_factor[gresunit]
+            self.res[gresname] = {
+                    "alloc": gres_alloc.get(gresname, 0) * uf,
+                    "total": gres_total.get(gresname, 0) * uf
+                    }
+
+        # rule of thumb: if there are 2 or more CPUs available and
+        # at least 2 * defmempercpu then there is room for another job.
+        # That's not perfect as far as the memory goes but it's a reasonable
+        # approximation of reality.
+        enough_cpu = self.res["cpu"]["total"] - self.res["cpu"]["alloc"] >= 2
+        enough_mem = self.res["mem"]["total"] - self.res["mem"]["alloc"] \
+            >= 2 * self.defmempercpu
+        self.can_run_another_job = enough_cpu and enough_mem
+
+    @property
+    def group(self):
+        """the group the node belongs to"""
+        if self._group is not None:
+            return self._group
+        else:
+            groupname = None
+            for grp, grp_part in self.groups:
+                if grp_part & self.part:
+                    groupname = grp
+                    break
+            if groupname is None:
+                groupname = "other"
+            self._group = groupname
+            return groupname
+
+
+class Resource(object):
+    """
+    An allocatable resource. The quantities are pretty self
+    explanatory except for unavail. Unavail refers to a
+    quantity that is idle but cannot be allocated (i.e.
+    idle memory on a node where all CPUs are allocated).
+
+    Use either Memory or Count subclasses.
+    """
+    __raw_rownames = ["", "", "idle", "alloc", "unavail", "", "usable",
+                      "down", "", "total"]
+    rownames = ["{0:8s}".format(a) for a in __raw_rownames]
+    fmt1 = "{0:>10s}     "
+    fmt2 = "{0:>10s} {1:3.0f}%"
+
+    def __init__(self, name):
+        self.name = name
+        self.idle = 0
+        self.alloc = 0
+        self.unavail = 0
+        self.down = 0
+        self.overalloc = 0
+
+    @property
+    def total(self):
+        return self.idle + self.alloc + self.unavail + self.down
+
+    @property
+    def usable(self):
+        return self.idle + self.alloc + self.unavail
+
+    @property
+    def summary(self):
+        if self.usable == 0:
+            pct = lambda x: 0
+        else:
+            pct = lambda x: 100.0 * x / self.usable
+        return [
+                 self.fmt1.format(self.name),
+                 "----------     ",
+                 self.fmt2.format(self.val2str(self.idle), pct(self.idle)),
+                 self.fmt2.format(self.val2str(self.alloc), pct(self.alloc)),
+                 self.fmt2.format(self.val2str(self.unavail), pct(self.unavail)),
+                 "----------     ",
+                 self.fmt1.format(self.val2str(self.usable)),
+                 self.fmt1.format(self.val2str(self.down)),
+                 "----------     ",
+                 self.fmt1.format(self.val2str(self.total)),
+               ]
+
+    def val2str(self, val):
+        return str(val)
+
+    def update(self, node):
+        """
+        Update the quantities based on the state of the
+        node given as an argument.
+        """
+        alloc = node.res[self.name]["alloc"]
+        total = node.res[self.name]["total"]
+        if alloc > total:
+            self.overalloc = alloc - total
+            alloc = total
+        if node.state == "DOWN":
+            self.down += total
+        elif node.state == "IDLE":
+            self.idle += total
+        elif node.state == "ALLOCATED":
+            self.alloc += alloc
+            self.unavail += total - alloc
+        elif node.state == "MIXED":
+            self.alloc += alloc
+            if node.can_run_another_job:
+                self.idle += total - alloc
+            else:
+                self.unavail += total - alloc
+        else:
+            die("Unexpected state '{0}'".format(node.state),
+                "for node {0}".format(node.name))
+
+
+class CountResource(Resource):
+    pass
+
+
+class MemoryResource(Resource):
+
+    def val2str(self, val):
+        """
+        memory internally is stored as MB. Format pretty for
+        display
+        """
+        units = ["MB", "GB", "TB", "PB"]
+        for unit in units:
+            if val < 1024.0:
+                return "{0:7.1f} {1}".format(val, unit)
+            else:
+                val /= 1024.0
+
+
+##########################################################################
+#                               FUNCTIONS                                #
+##########################################################################
+
+
+def die(*args):
+    print >>sys.stderr, "\n".join(args)
+    sys.exit(1)
+
+
+def parse_gres(gres_str):
+    """parse gres string and return tuple (name, quantity)"""
+    fields = gres_str.strip().split(":")
+    try:
+        return (fields[0], int(fields[-1]))
+    except ValueError:
+        die("Malformed gres string: {0}\n".format(gres_str))
+
+
+def get_node_info(excluded_partitions):
+    """
+    Return a dictionary of Node objects with
+    allocated resources. Used for summary statistics
+    later on.
+
+    The def_mem_per_cpu value for each node is the
+    smallest value of all the partitions that a
+    node belongs to. This is used to decide if
+    there is unallocatable memory on a node. Excluded
+    partitions are not considered.
+    """
+
     all_parts = pyslurm.partition().get()
-    defmempercpu = {}
     all_nodes = {}
 
+    # go through the partitions and collect basic node info
     for part, partinfo in all_parts.items():
-        defmempercpu[part] = partinfo["def_mem_per_cpu"]
-        nodes = hostlist.expand_hostlist(partinfo["nodes"])
-        if part not in OVERLAPPING_PARTITIONS:
-            for node in nodes:
-                all_nodes[node] = part
+        defmempercpu = partinfo["def_mem_per_cpu"]
+        if part not in excluded_partitions:
+            nodelist = hostlist.expand_hostlist(partinfo["nodes"])
+            for nodename in nodelist:
+                if nodename not in all_nodes:
+                    all_nodes[nodename] = Node(nodename)
+                all_nodes[nodename].update_defmempercpu(defmempercpu)
+                all_nodes[nodename].add_part(part)
 
-    return (defmempercpu, all_nodes)
+    # now collect state for all nodes
+    for nodename, nodestate in pyslurm.node().get().items():
+        try:
+            node = all_nodes[nodename]
+        except KeyError:
+            die("pyslurm.node() included a node [{0}] not",
+                "configured in partitions".format(nodename))
+        node.set_state(nodestate)
 
+    return all_nodes
 
-def get_util(nodes):
-    """ Return a tuple of cpu and memory percent values.
-
-    IN: (dict) dictionary of all nodes from pyslurm.node().get()
-    OUT: (tuple) cpu and mem percent util
+def summarize_metrics(nodes, gres, title, filter_fun):
     """
-    all_metrics = {"total_cpus_alloc": 0,
-                   "total_cpus_idle": 0,
-                   "total_cpus_down": 0,
-                   "total_cpus_unalloc": 0,
-                   "total_cpus_config": 0,
-                   "total_memory_alloc": 0,
-                   "total_memory_idle": 0,
-                   "total_memory_down": 0,
-                   "total_memory_unalloc": 0,
-                   "total_memory_overalloc": 0,
-                   "total_memory_config": 0,
-                   "total_nodes_mixed": 0,
-                   "total_nodes_alloc": 0,
-                   "total_nodes_idle": 0,
-                   "total_nodes_down": 0,
-                   "total_nodes_config": 0}
-
-    defmempercpu, all_nodes = get_part_info()
-
-    for node in nodes:
-        nodeinfo = nodes.get(node)
-
-        state = nodeinfo.get("state").upper()
-        cpus_alloc = nodeinfo.get("alloc_cpus")
-        cpus_total = nodeinfo.get("cpus")
-        memory_alloc = nodeinfo.get("alloc_mem")
-        memory_real = nodeinfo.get("real_memory")
-
-        all_metrics["total_nodes_config"] += 1
-        all_metrics["total_cpus_config"] += cpus_total
-        all_metrics["total_memory_config"] += memory_real
-
-        if "DOWN" in state or "DRAIN" in state:
-            all_metrics["total_nodes_down"] += 1
-            all_metrics["total_cpus_down"] += cpus_total
-            all_metrics["total_memory_down"] += memory_real
+    take a dict of nodes, alist of (gresname, gresunit) tuples 
+    and a function that takes a node and returns true/false
+    to be used as a filter and summarize resource usage. Title
+    is used in the output heading.
+    """
+    resources = [CountResource("cpu"), MemoryResource("mem")]
+    for gresname, gresunit in gres:
+        if gresunit == "count":
+            resources.append(CountResource(gresname))
         else:
-            all_metrics["total_cpus_alloc"] += cpus_alloc
+            resources.append(MemoryResource(gresname))
+    nodestates = defaultdict(int)
 
-            if ("ALLOCATED" in state):
-                all_metrics["total_nodes_alloc"] += 1
-                all_metrics["total_cpus_unalloc"] += cpus_total - cpus_alloc
-                if memory_alloc > memory_real:
-                    all_metrics["total_memory_alloc"] += memory_real
-                    all_metrics["total_memory_unalloc"] += 0
-                    all_metrics["total_memory_overalloc"] += memory_alloc - memory_real
-                else:
-                    all_metrics["total_memory_alloc"] += memory_alloc
-                    all_metrics["total_memory_unalloc"] += memory_real - memory_alloc
-            elif "MIXED" in state:
-                all_metrics["total_nodes_mixed"] += 1
-                if memory_alloc > memory_real:
-                    all_metrics["total_cpus_unalloc"] += cpus_total - cpus_alloc
-                    all_metrics["total_memory_alloc"] += memory_real
-                    all_metrics["total_memory_unalloc"] += 0
-                    all_metrics["total_memory_overalloc"] += memory_alloc - memory_real
-                elif (memory_real - memory_alloc) < (2 * defmempercpu[all_nodes[node]]):
-                    all_metrics["total_cpus_unalloc"] += cpus_total - cpus_alloc
-                    all_metrics["total_memory_alloc"] += memory_alloc
-                    all_metrics["total_memory_unalloc"] += memory_real - memory_alloc
-                else:
-                    all_metrics["total_cpus_idle"] += cpus_total - cpus_alloc
-                    all_metrics["total_memory_alloc"] += memory_alloc
-                    all_metrics["total_memory_idle"] += memory_real - memory_alloc
-            elif ("IDLE" in state) or ("RESERVED" in state):
-                all_metrics["total_nodes_idle"] += 1
-                all_metrics["total_cpus_idle"] += cpus_total
-                all_metrics["total_memory_idle"] += memory_real
+    # Summarize resource usage for the selected nodes
+    for node in [a for a in nodes.values() if filter_fun(a)]:
+        nodestates[node.state] += 1
+        for res in resources:
+            res.update(node)
 
-
-    assert all_metrics["total_nodes_alloc"] + \
-           all_metrics["total_nodes_mixed"] + \
-           all_metrics["total_nodes_idle"] + \
-           all_metrics["total_nodes_down"] == all_metrics["total_nodes_config"]
-
-    assert (all_metrics["total_cpus_alloc"] +
-            all_metrics["total_cpus_idle"] +
-            all_metrics["total_cpus_unalloc"] +
-            all_metrics["total_cpus_down"] == all_metrics["total_cpus_config"])
-
-    assert (all_metrics["total_memory_alloc"] +
-            all_metrics["total_memory_idle"] +
-            all_metrics["total_memory_unalloc"] +
-            all_metrics["total_memory_down"] == all_metrics["total_memory_config"])
-
-    return all_metrics
-
-
-def display_metrics(metrics, part_name):
-    """ Print cluster utilization.
-
-    IN: (dict) dictionary of all node, cpu and memory states
-    """
-    print ""
-    if part_name:
-        print part_name[0].upper(), "partition\n"
-        title = "Partition"
-    else:
-        title = "Cluster"
-
-    print fmt1.format("Total Allocated Nodes", metrics["total_nodes_alloc"])
-    print fmt1.format("Total Mixed Nodes", metrics["total_nodes_mixed"])
-    print fmt1.format("Total Idle Nodes", metrics["total_nodes_idle"])
-    print fmt1.format("Total Down/Offline Nodes", metrics["total_nodes_down"])
-    print fmt1.format(
-        "Total Eligible Nodes",
-        metrics["total_nodes_config"] - metrics["total_nodes_down"]
-    )
-    print fmt1.format("Total Configured Nodes", metrics["total_nodes_config"])
+    print "\n{0:=^80}".format(" {0} ".format(title))
+    total_nodes = sum(nodestates.values())
+    states = ["ALLOCATED", "IDLE", "MIXED", "DOWN"]
+    print " | ".join("{0:>11s}".format(a) for a in states) + \
+            " | {0:>11s}".format("TOTAL")
+    print " | ".join(" {0:5d} {1:3.0f}%".format(
+        nodestates[a], 100.0 * nodestates[a] / total_nodes) for a in states) + \
+                " | {0:11d}".format(sum(nodestates.values()))
+    print "=" * 80
     print ""
 
-    print fmt1.format("Total Allocated CPUs", metrics["total_cpus_alloc"])
-    print fmt1.format("Total Idle CPUs", metrics["total_cpus_idle"])
-    print fmt1.format("Total Down CPUs", metrics["total_cpus_down"])
-    print fmt1.format("Total Unallocatable CPUs", metrics["total_cpus_unalloc"])
-    print fmt1.format(
-        "Total Eligible CPUs",
-        metrics["total_cpus_config"] - metrics["total_cpus_down"]
-    )
-    print fmt1.format("Total Configured CPUs", metrics["total_cpus_config"])
-    print fmt2.format(
-        title + " CPU % Unallocatable",
-        metrics["total_cpus_unalloc"] * 100 / (metrics["total_cpus_config"] -
-                                               metrics["total_cpus_down"])
-    )
-    print fmt2.format(
-        title + " CPU % (Alloc + Unalloc)",
-        (metrics["total_cpus_alloc"] + metrics["total_cpus_unalloc"]) * 100 / (
-         metrics["total_cpus_config"] - metrics["total_cpus_down"])
-    )
-    print ""
+    print "\n".join(" ".join(a) for a in
+                    zip(Resource.rownames, *[a.summary for a in resources]))
 
-    print fmt1.format(
-        "Total Allocated Memory",
-        human_readable(metrics["total_memory_alloc"] * 1024 * 1024)
-    )
-    print fmt1.format(
-        "Total Idle Memory",
-        human_readable(metrics["total_memory_idle"] * 1024 * 1024)
-    )
-    print fmt1.format(
-        "Total Down Memory",
-        human_readable(metrics["total_memory_down"] * 1024 * 1024)
-    )
-    print fmt1.format(
-        "Total Unallocatable Memory",
-        human_readable(metrics["total_memory_unalloc"] * 1024 * 1024)
-    )
-    print fmt1.format(
-        "Total Overallocated Memory",
-        human_readable(metrics["total_memory_overalloc"] * 1024 * 1024)
-    )
-    print fmt1.format(
-        "Total Eligible Memory",
-        human_readable((metrics["total_memory_config"] -
-                        metrics["total_memory_down"]) * 1024 * 1024)
-    )
-    print fmt1.format(
-        "Total Configured Memory",
-        human_readable(metrics["total_memory_config"] * 1024 * 1024)
-    )
-    print fmt2.format(
-        title + " Memory % Unallocatable",
-        metrics["total_memory_unalloc"] * 100 / (metrics["total_memory_config"] -
-                                                 metrics["total_memory_down"])
-    )
-    print fmt2.format(
-        title + " Memory % (Alloc + Unalloc)",
-        (metrics["total_memory_alloc"] + metrics["total_memory_unalloc"]) * 100 /
-        (metrics["total_memory_config"] - metrics["total_memory_down"])
-    )
-    print ""
-
-
-def get_gpu_util(nodes, gpupart=None):
+def format_config():
     """
+    format config settings for inclusion in help output
     """
-    gpu_usage = defaultdict(lambda: defaultdict(int))
+    excl = "\n        ".join(EXCLUDED_PARTITIONS)
+    groups = ""
+    for grp, parts in PARTITION_GROUPS:
+        groups += "\n        {0}".format(grp)
+        for part in parts:
+            groups += "\n          - {0}".format(part)
+    gres = "\n        ".join("{0:12} ({1})".format(a, b) for a, b in GRES) 
+    txt = """
+      EXCLUDED_PARTITIONS: 
+        {excl}
+      PARTITION_GROUPS:{groups}
+      GRES:
+        {gres}
+        """.format(excl = excl, groups = groups, gres = gres)
+    return txt
 
-    if gpupart is not None:
-        gpupartlist = [gpupart]
-    else:
-        gpupartlist = GPU_PARTITIONS
-
-    for part in gpupartlist:
-        nodelist = pyslurm.partition().find_id(part).get("nodes")
-        nodes_in_part = hostlist.expand_hostlist(nodelist)
-
-        for node in nodes_in_part:
-            gres_avail = [g for g in nodes.get(node).get("gres") if "gpu" in g]
-            gpu_usage[part]["avail"] += int(gres_avail[0].split(":")[-1])
-
-            gres_used = [g for g in nodes.get(node).get("gres_used") if "gpu" in g]
-            gpu_usage[part]["used"] += int(gres_used[0].split(":")[-1])
-
-    return gpu_usage
-
-
-def display_gpu_metrics(gpu_metrics):
-    """
-    """
-    print "GPU Utilization"
-    print 15 * "-"
-    for item in gpu_metrics.items():
-        print "{0:<36} : {1:>8} {2}".format(
-            item[0],
-            str(item[1]["used"]) + "/" + str(item[1]["avail"]),
-            "(Used/Avail)"
-        )
 
 
 if __name__ == "__main__":
-    # Set up command line arguments
-    description = "Query cluster utilization"
-    parser = argparse.ArgumentParser(description=description)
-    parser.add_argument("-p", help="show partition", dest="part", nargs=1)
-    args = parser.parse_args()
 
-    if not args.part:
-        # Get full cluster utilization (all nodes in all partitions)
-        try:
-            # Make sure pyslurm works or else exit here
-            pyslurmnode = pyslurm.node()
-            # Get all node info
-            nodes = pyslurmnode.get()
-        except ValueError as e:
-            print 'Query failed - %s' % (e)
-            sys.exit(1)
+    # Check the configuration for validity
+    for _, unit in GRES:
+        if unit not in ("count", "MB", "GB", "TB"):
+            die("Unknown unit '{0}' in GRES configuration".format(unit))
+
+    # set up the command line and check arguments for validity
+    cmdline = argparse.ArgumentParser(epilog = __doc__ + format_config(), 
+            formatter_class=argparse.RawDescriptionHelpFormatter)
+    cmdline.add_argument("-p", "--partition", 
+            help="Show only nodes in the listed partition(s)." + \
+                    " Can be used multiple times. Overrides -g.",
+            action="append")
+    cmdline.add_argument("-g", "--group",
+            help="Also show metrics for individual node groups",
+            action="store_true", default = False)
+    args = cmdline.parse_args()
+
+    # collection information
+    nodes = get_node_info(EXCLUDED_PARTITIONS)
+
+    if args.partition is not None:
+        summarize_metrics(nodes, GRES, title=", ".join(args.partition) + " Nodes",
+                filter_fun=lambda n: n.part & set(args.partition))
     else:
-        nodes_in_part = hostlist.expand_hostlist(
-            pyslurm.partition().find_id(args.part[0])["nodes"]
-        )
-        nodes = {}
-        for node in nodes_in_part:
-            nodes[node] = pyslurm.node().find_id(node)
-
-    metrics = get_util(nodes)
-    display_metrics(metrics, args.part)
-
-    if GPU_PARTITIONS:
-        if not args.part:
-            gpu_metrics = get_gpu_util(nodes)
-            display_gpu_metrics(gpu_metrics)
-        elif args.part[0] in GPU_PARTITIONS:
-            gpu_metrics = get_gpu_util(nodes, args.part[0])
-            display_gpu_metrics(gpu_metrics)
+        # metrics for all nodes
+        summarize_metrics(nodes, GRES, "All Nodes", lambda x: True)
+        if args.group and len(PARTITION_GROUPS) > 0:
+            for group, _ in PARTITION_GROUPS:
+                summarize_metrics(nodes, GRES, group, lambda x: x.group == group)
