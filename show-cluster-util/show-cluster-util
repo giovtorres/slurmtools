@@ -29,7 +29,8 @@ try:
 except ImportError:
     die("This tool requires python-hostlist")
 
-sys.path.insert(0, "/usr/local/pyslurm/latest/lib64/python2.6/site-packages")
+sys.path.insert(0, "/tmp/lib/python2.7/site-packages")
+
 try:
     import pyslurm
 except ImportError:
@@ -39,8 +40,11 @@ except ImportError:
 ##########################################################################
 #                                 CONFIG                                 #
 ##########################################################################
-# purely floating partitions should be excluded
-EXCLUDED_PARTITIONS = ["maint", "interactive"]
+# purely floating partitions
+FLOATING_PARTITIONS = set(["maint"])
+
+# nodes *only* in ignored partitions are not included in the totals
+IGNORED_PARTITIONS = set(["dontcountme"])
 
 # nodes can be assigned to different groups for separate reporting based
 # on their partition. The first group that matches will be assigned to
@@ -48,7 +52,6 @@ EXCLUDED_PARTITIONS = ["maint", "interactive"]
 # into one of the groups are put into the automatic "other" group.
 # If PARTITION_GROUPS is [], nodes cannot be split out into
 # separate groups.
-# EXAMPLE:
 #   PARTITION_GROUPS = [ 
 #        ["Old Nodes", ["old1", "old2"]],
 #        ["New Nodes", ["new1", "new2", "new3"]]]
@@ -111,45 +114,64 @@ class Node(object):
         """
         # clean up the node state; this should take care of
         # states like "DOWN*", "MIXED+DRAIN", ...
-        rawstate = nodeinfo["state"].strip().upper()
-        if "DRAIN" in rawstate or "DOWN" in rawstate:
-            self.state = "DOWN"
-        elif "IDLE" in rawstate:
-            self.state = "IDLE"
-        elif "MIXED" in rawstate:
-            self.state = "MIXED"
-        elif "ALLOCATED" in rawstate:
-            self.state = "ALLOCATED"
-        else:
-            die("Bad state '{0}' for node '{1}'".format(rawstate, self.name))
+        # I'm considering nodes in state UNKNOWN as DOWN
+        try:
+            rawstate = nodeinfo["state"].strip().upper()
+            if "DRAIN" in rawstate or "DOWN" in rawstate or "UNKNOWN" in rawstate:
+                self.state = "DOWN"
+            elif "IDLE" in rawstate:
+                self.state = "IDLE"
+            elif "MIXED" in rawstate:
+                self.state = "MIXED"
+            elif "ALLOCATED" in rawstate:
+                self.state = "ALLOCATED"
+            elif "RESERVED" in rawstate:
+                self.state = "RESERVED"
+            elif "MAINT" in rawstate:
+                self.state = "MAINT"
+            else:
+                die("Bad state '{0}' for node '{1}'".format(rawstate, self.name))
 
-        self.res["cpu"] = {
+            self.res["cpu"] = {
                 "alloc": nodeinfo["alloc_cpus"],
                 "total": nodeinfo["cpus"]
                 }
-        # slurm returns memory in MB - no conversion required
-        self.res["mem"] = {
+            # slurm returns memory in MB - no conversion required
+            self.res["mem"] = {
                 "alloc": nodeinfo["alloc_mem"],
                 "total": nodeinfo["real_memory"]
                 }
 
-        gres_total = dict(parse_gres(a) for a in nodeinfo["gres"])
-        gres_alloc = dict(parse_gres(a) for a in nodeinfo["gres_used"])
-        for gresname, gresunit in self.gres:
-            uf = self.unit_factor[gresunit]
-            self.res[gresname] = {
+            # parse_gres returns None for gres that can't be parsed
+            gres_total = {}
+            for pg in (parse_gres(a) for a in nodeinfo["gres"]):
+                if pg is not None:
+                    gres_total[pg[0]] = pg[1]
+            gres_alloc = {}
+            for pg in (parse_gres(a) for a in nodeinfo["gres_used"]):
+                if pg is not None:
+                    gres_alloc[pg[0]] = pg[1]
+            for gresname, gresunit in self.gres:
+                uf = self.unit_factor[gresunit]
+                self.res[gresname] = {
                     "alloc": gres_alloc.get(gresname, 0) * uf,
                     "total": gres_total.get(gresname, 0) * uf
                     }
 
-        # rule of thumb: if there are 2 or more CPUs available and
-        # at least 2 * defmempercpu then there is room for another job.
-        # That's not perfect as far as the memory goes but it's a reasonable
-        # approximation of reality.
-        enough_cpu = self.res["cpu"]["total"] - self.res["cpu"]["alloc"] >= 2
-        enough_mem = self.res["mem"]["total"] - self.res["mem"]["alloc"] \
-            >= 2 * self.defmempercpu
-        self.can_run_another_job = enough_cpu and enough_mem
+            # rule of thumb: if there are 2 or more CPUs available and
+            # at least 2 * defmempercpu then there is room for another job.
+            # That's not perfect as far as the memory goes but it's a reasonable
+            # approximation of reality.
+            enough_cpu = self.res["cpu"]["total"] - self.res["cpu"]["alloc"] >= 2
+            enough_mem = self.res["mem"]["total"] - self.res["mem"]["alloc"] \
+                >= 2 * self.defmempercpu
+            self.can_run_another_job = enough_cpu and enough_mem
+        except AttributeError as ae:
+            print("AttributeError: {0} while processing node {1}".format(ae.message, self.name))
+            pass
+        except KeyError as ke:
+            print("KeyError: {0} while processing node {1}".format(ke.message, self.name))
+            pass
 
     @property
     def group(self):
@@ -178,7 +200,7 @@ class Resource(object):
     Use either Memory or Count subclasses.
     """
     __raw_rownames = ["", "", "idle", "alloc", "unavail", "", "usable",
-                      "down", "", "total"]
+                      "down", "maint", "", "total"]
     rownames = ["{0:8s}".format(a) for a in __raw_rownames]
     fmt1 = "{0:>10s}     "
     fmt2 = "{0:>10s} {1:3.0f}%"
@@ -189,6 +211,7 @@ class Resource(object):
         self.alloc = 0
         self.unavail = 0
         self.down = 0
+        self.maint = 0
         self.overalloc = 0
 
     @property
@@ -214,9 +237,30 @@ class Resource(object):
                  "----------     ",
                  self.fmt1.format(self.val2str(self.usable)),
                  self.fmt1.format(self.val2str(self.down)),
+                 self.fmt1.format(self.val2str(self.maint)),
                  "----------     ",
                  self.fmt1.format(self.val2str(self.total)),
                ]
+    @property
+    def summary_dict(self):
+        if self.usable == 0:
+            pct = lambda x: 0
+        else:
+            pct = lambda x: 100.0 * x / self.usable
+        res = {}
+        res["percent_{0}_alloc".format(self.name)] = pct(self.alloc)
+        res["{0}_alloc".format(self.name)] = self.alloc
+        res["percent_{0}_unalloc".format(self.name)] = pct(self.unavail)
+        res["{0}_unalloc".format(self.name)] = self.unavail
+        res["percent_{0}_idle".format(self.name)] = pct(self.idle)
+        res["{0}_idle".format(self.name)] = self.idle
+        res["percent_{0}_util".format(self.name)] = 100 - pct(self.idle)
+        res["{0}_util".format(self.name)] = self.usable - self.idle
+
+        res["{0}_down".format(self.name)] = self.down
+        res["{0}_maint".format(self.name)] = self.maint
+        res["{0}_avail".format(self.name)] = self.usable
+        return res
 
     def val2str(self, val):
         return str(val)
@@ -226,27 +270,42 @@ class Resource(object):
         Update the quantities based on the state of the
         node given as an argument.
         """
-        alloc = node.res[self.name]["alloc"]
-        total = node.res[self.name]["total"]
-        if alloc > total:
-            self.overalloc = alloc - total
-            alloc = total
-        if node.state == "DOWN":
-            self.down += total
-        elif node.state == "IDLE":
-            self.idle += total
-        elif node.state == "ALLOCATED":
-            self.alloc += alloc
-            self.unavail += total - alloc
-        elif node.state == "MIXED":
-            self.alloc += alloc
-            if node.can_run_another_job:
-                self.idle += total - alloc
-            else:
+        try:
+            alloc = node.res[self.name]["alloc"]
+            total = node.res[self.name]["total"]
+            if alloc > total:
+                self.overalloc = alloc - total
+                alloc = total
+            if node.state == "DOWN":
+                self.down += total
+            elif node.state == "IDLE":
+                self.idle += total
+            elif node.state == "ALLOCATED":
+                self.alloc += alloc
                 self.unavail += total - alloc
-        else:
-            die("Unexpected state '{0}'".format(node.state),
-                "for node {0}".format(node.name))
+            elif node.state == "MIXED":
+                self.alloc += alloc
+                if node.can_run_another_job:
+                    self.idle += total - alloc
+                else:
+                    self.unavail += total - alloc
+            elif node.state == "RESERVED":
+                # a reserved node is unavailable. once it starts running
+                # jobs it will go into the MIXED or ALLOCATED state
+                self.unavail += total
+            elif node.state == "MAINT":
+                # a node in MAINT state is unavailable
+                self.maint += total
+            else:
+                die("Unexpected state '{0}'".format(node.state),
+                    "for node {0}".format(node.name))
+        except AttributeError as ae:
+            print("AttributeError: {0} in Resource({1}).update({2})".format(ae.message, self.name, node.name))
+            pass
+        except KeyError as ke:
+            print("KeyError: {0} in Resource({1}).update({2})".format(ke.message, self.name, node.name))
+            pass
+
 
 
 class CountResource(Resource):
@@ -279,15 +338,25 @@ def die(*args):
 
 
 def parse_gres(gres_str):
-    """parse gres string and return tuple (name, quantity)"""
-    fields = gres_str.strip().split(":")
+    """parse gres string and return tuple (name, quantity)
+       With slurm update, GresUsed now includes indices: 
+       GresUsed=gpu:k80:4(IDX:0-3) and GresUsed=gpu:k80:4(IDX:0,3).
+       Returns None if string could not be parsed.
+    """
+    open_paren = gres_str.find('(')
+    if open_paren != -1:
+        fields = gres_str[0:open_paren].strip().split(':')
+    else:
+        fields = gres_str.strip().split(":")
+    if len(fields) not in (2, 3):
+        return None
     try:
-        return (fields[0], int(fields[-1]))
+        nused = int(fields[-1])
     except ValueError:
-        die("Malformed gres string: {0}\n".format(gres_str))
+        return None
+    return (fields[0], nused)
 
-
-def get_node_info(excluded_partitions):
+def get_node_info(floating_partitions, ignored_partitions):
     """
     Return a dictionary of Node objects with
     allocated resources. Used for summary statistics
@@ -300,30 +369,63 @@ def get_node_info(excluded_partitions):
     partitions are not considered.
     """
 
-    all_parts = pyslurm.partition().get()
-    all_nodes = {}
+    warnings = []
+    
+    n = 0
+    while n < 5:
+        try:
+            partitions = pyslurm.partition().get()
+            break
+        except ValueError:
+            n += 1
+            time.sleep(1)
+    if n == 5:
+        return None, None
+    partition_set = set(partitions.keys())
+    nodes_in_partitions = {}
 
     # go through the partitions and collect basic node info
-    for part, partinfo in all_parts.items():
+    # this creates a list of all nodes that are in *any* partition
+    for part, partinfo in partitions.items():
         defmempercpu = partinfo["def_mem_per_cpu"]
-        if part not in excluded_partitions:
-            nodelist = hostlist.expand_hostlist(partinfo["nodes"])
-            for nodename in nodelist:
-                if nodename not in all_nodes:
-                    all_nodes[nodename] = Node(nodename)
-                all_nodes[nodename].update_defmempercpu(defmempercpu)
-                all_nodes[nodename].add_part(part)
+        nodelist = hostlist.expand_hostlist(partinfo["nodes"])
+        for nodename in nodelist:
+            if nodename not in nodes_in_partitions:
+                nodes_in_partitions[nodename] = Node(nodename)
+            nodes_in_partitions[nodename].update_defmempercpu(defmempercpu)
+            nodes_in_partitions[nodename].add_part(part)
 
-    # now collect state for all nodes
-    for nodename, nodestate in pyslurm.node().get().items():
+    # now collect state for all nodes in slurm. If timing out, retry
+    n = 0
+    while n < 5:
         try:
-            node = all_nodes[nodename]
-        except KeyError:
-            die("pyslurm.node() included a node [{0}] not",
-                "configured in partitions".format(nodename))
-        node.set_state(nodestate)
+            nodes_in_slurm = pyslurm.node().get()
+            break
+        except ValueError:
+            # pyslurm raises a ValueError when the call to slurm times out
+            n += 1
+            time.sleep(1)
 
-    return all_nodes
+    if n == 5:
+        return None, None
+    for nodename, nodestate in nodes_in_slurm.items():
+        if nodename in nodes_in_partitions:
+            nodes_in_partitions[nodename].set_state(nodestate)
+            if nodes_in_partitions[nodename].part.issubset(ignored_partitions):
+                warnings.append("Node {0} ({1}) is only part of ignored partitions; not included".format(
+                    nodename, ",".join(nodes_in_partitions[nodename].part)))
+                del(nodes_in_partitions[nodename])
+                continue
+            if nodes_in_partitions[nodename].part.issubset(floating_partitions):
+                warnings.append("Node {0} ({1}) is only part of floating partitions".format(
+                    nodename, ",".join(nodes_in_partitions[nodename].part)))
+        else:
+            # if a node is not in any partition, remove it from the list
+            # of nodes and record a warning
+            del(nodes_in_partitions[nodename])
+            warnings.append("Node {0} is in slurm but not part of any partition".format(nodename))
+
+    return warnings, nodes_in_partitions
 
 def summarize_metrics(nodes, gres, title, filter_fun):
     """
@@ -346,14 +448,13 @@ def summarize_metrics(nodes, gres, title, filter_fun):
         for res in resources:
             res.update(node)
 
-    print "\n{0:=^80}".format(" {0} ".format(title))
+    total = sum(nodestates.values())
+    print "\n{0:=^80}".format(" {0} (N = {1}) ".format(title, total))
     total_nodes = sum(nodestates.values())
-    states = ["ALLOCATED", "IDLE", "MIXED", "DOWN"]
-    print " | ".join("{0:>11s}".format(a) for a in states) + \
-            " | {0:>11s}".format("TOTAL")
-    print " | ".join(" {0:5d} {1:3.0f}%".format(
-        nodestates[a], 100.0 * nodestates[a] / total_nodes) for a in states) + \
-                " | {0:11d}".format(sum(nodestates.values()))
+    states = ["ALLOCATED", "IDLE", "MIXED", "RESERVED", "DOWN", "MAINT"]
+    print " |".join("{0:>11s}".format(a) for a in states)
+    print " |".join(" {0:5d} {1:3.0f}%".format(
+        nodestates[a], 100.0 * nodestates[a] / total_nodes) for a in states)
     print "=" * 80
     print ""
 
@@ -364,7 +465,8 @@ def format_config():
     """
     format config settings for inclusion in help output
     """
-    excl = "\n        ".join(EXCLUDED_PARTITIONS)
+    floating = "\n        ".join(FLOATING_PARTITIONS)
+    ignored  = "\n        ".join(IGNORED_PARTITIONS)
     groups = ""
     for grp, parts in PARTITION_GROUPS:
         groups += "\n        {0}".format(grp)
@@ -372,12 +474,15 @@ def format_config():
             groups += "\n          - {0}".format(part)
     gres = "\n        ".join("{0:12} ({1})".format(a, b) for a, b in GRES) 
     txt = """
-      EXCLUDED_PARTITIONS: 
-        {excl}
+      FLOATING_PARTITIONS: 
+        {floating}
+      FLOATING_PARTITIONS: 
+        {ignored}
       PARTITION_GROUPS:{groups}
       GRES:
         {gres}
-        """.format(excl = excl, groups = groups, gres = gres)
+        """.format(floating = floating, ignored = ignored,
+                groups = groups, gres = gres)
     return txt
 
 
@@ -399,10 +504,17 @@ if __name__ == "__main__":
     cmdline.add_argument("-g", "--group",
             help="Also show metrics for individual node groups",
             action="store_true", default = False)
+    cmdline.add_argument("-v", "--verbose",
+            help="Show notes about possible configuration issues",
+            action="store_true", default = False)
     args = cmdline.parse_args()
+    
 
-    # collection information
-    nodes = get_node_info(EXCLUDED_PARTITIONS)
+    warnings, nodes = get_node_info(FLOATING_PARTITIONS, IGNORED_PARTITIONS)
+    if nodes is None:
+        print >>sys.stderr, "Could not reach the Slurm controller. Please try again later"
+        sys.exit(1)
+
 
     if args.partition is not None:
         summarize_metrics(nodes, GRES, title=", ".join(args.partition) + " Nodes",
@@ -413,3 +525,7 @@ if __name__ == "__main__":
         if args.group and len(PARTITION_GROUPS) > 0:
             for group, _ in PARTITION_GROUPS:
                 summarize_metrics(nodes, GRES, group, lambda x: x.group == group)
+    
+    if len(warnings) > 0 and args.verbose:
+        print "\n\n{0:=^80}".format(" Warnings ")
+        print "\n".join("- {0}".format(a) for a in warnings)
